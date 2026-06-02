@@ -1,0 +1,59 @@
+# ───────────────────────── Python ─────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+.eggs/
+build/
+dist/
+pip-wheel-metadata/
+
+# ──────────────── Virtual env / package managers ───────────
+.venv/
+venv/
+env/
+.python-version
+# uv: keep uv.lock tracked if you adopt it (reproducible env); ignore the cache
+.uv/
+
+# ───────────────────────── Caches ──────────────────────────
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+.cache/
+
+# ────────────────────── Editors / OS ───────────────────────
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# ────────────────── Docker build artifacts ─────────────────
+docker-build.log
+
+# ─────────── Model weights / checkpoints (NOT source) ───────
+# Downloaded HF checkpoints and training outputs. These are large binaries.
+# NOTE: small reference assets that ARE tracked on purpose live under
+#   configs/**/(preprocessing|reference_data|scaling_factors), plus model
+#   Jd.pt files — so do NOT add a blanket `*.pt` / `*.npz` rule here.
+/checkpoints/
+*.ckpt
+
+# ─────────────────── Training run outputs ──────────────────
+/outputs/
+/logs/
+/results/
+/runs/
+wandb/
+*.log
+
+# ──────── Local datasets / large data artifacts ────────────
+# Mount these at runtime; never commit them.
+*.aselmdb
+*.aselmdb-lock
+*.lmdb
+*.lmdb-lock
+metadata*.npz

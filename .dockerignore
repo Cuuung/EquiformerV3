@@ -1,0 +1,28 @@
+# Local virtualenv (rebuilt inside the image)
+.venv/
+
+# Git metadata (version is pinned via SETUPTOOLS_SCM_PRETEND_VERSION)
+.git/
+.github/
+
+# Python caches
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+.pytest_cache/
+.ruff_cache/
+
+# Large artifacts: mount at runtime instead of baking into the image
+checkpoints/
+*.aselmdb
+*.lmdb
+metadata*.npz
+*.json.gz
+data/
+datasets_local/
+outputs/
+wandb/
+
+# Misc
+*.log
+.DS_Store
