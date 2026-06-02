@@ -189,7 +189,7 @@ optim:
   eval_batch_size:              64
   load_balancing:               atoms
   num_workers:                  0     # lmdb env is not fork-safe -> num_workers>0 segfaults; needs a worker_init reconnect patch first
-  lr_initial:                   0.0002     # paired with batch_size=64 (the base config's native pairing); see note below if GPU count != 2
+  lr_initial:                   0.0001     # for 2 GPU x batch 64 = global 128; rescale if GPU count differs (~ 2e-4 * global_bs / 512)
 
   optimizer:                    AdamW
   optimizer_params:
