@@ -722,7 +722,7 @@ class BaseTrainer(ABC):
                 )
 
     def load_optimizer(self) -> None:
-        optimizer = getattr(torch.optim, self.config["optim"].get("optimizer", "AdamW"))
+        optimizer_name = self.config["optim"].get("optimizer", "AdamW")
         optimizer_params = self.config["optim"].get("optimizer_params", {})
 
         weight_decay = optimizer_params.get("weight_decay", 0)
@@ -733,6 +733,13 @@ class BaseTrainer(ABC):
                 "Please update your config to use `optim.optimizer_params.weight_decay`."
                 "`optim.weight_decay` will soon be deprecated."
             )
+
+        # Custom optimizers that are not attributes of `torch.optim` are resolved here.
+        if optimizer_name == "HybridMuon":
+            self._load_hybrid_muon(optimizer_params, weight_decay)
+            return
+
+        optimizer = getattr(torch.optim, optimizer_name)
 
         if weight_decay > 0:
             self.model_params_no_wd = {}
@@ -770,6 +777,51 @@ class BaseTrainer(ABC):
                 lr=self.config["optim"]["lr_initial"],
                 **optimizer_params,
             )
+
+    def _load_hybrid_muon(self, optimizer_params: dict, weight_decay: float) -> None:
+        """Build a HybridMuon optimizer: Muon for weight matrices, AdamW for the rest.
+
+        `optimizer_params` keys: `weight_decay` (already extracted), optional `muon_lr`
+        (defaults to `optim.lr_initial`), and any Muon/AdamW hyper-params among
+        {momentum, nesterov, ns_steps, betas, eps}.
+        """
+        from fairchem.core.common.muon import (
+            HybridMuon,
+            build_hybrid_muon_param_groups,
+        )
+
+        no_wd = set()
+        if hasattr(self._unwrapped_model, "no_weight_decay"):
+            no_wd = self._unwrapped_model.no_weight_decay()
+
+        adamw_lr = self.config["optim"]["lr_initial"]
+        muon_lr = optimizer_params.get("muon_lr", adamw_lr)
+        param_groups = build_hybrid_muon_param_groups(
+            self.model,
+            no_weight_decay=no_wd,
+            weight_decay=weight_decay,
+            adamw_lr=adamw_lr,
+            muon_lr=muon_lr,
+        )
+
+        if distutils.is_master():
+            n_muon = sum(
+                p.numel() for g in param_groups if g["use_muon"] for p in g["params"]
+            )
+            n_adamw = sum(
+                p.numel() for g in param_groups if not g["use_muon"] for p in g["params"]
+            )
+            logging.info(
+                f"HybridMuon: {n_muon:,} params on Muon (lr={muon_lr}), "
+                f"{n_adamw:,} params on AdamW (lr={adamw_lr}), weight_decay={weight_decay}"
+            )
+
+        muon_kwargs = {
+            k: v
+            for k, v in optimizer_params.items()
+            if k in {"momentum", "nesterov", "ns_steps", "betas", "eps"}
+        }
+        self.optimizer = HybridMuon(param_groups, lr=adamw_lr, **muon_kwargs)
 
     def load_extras(self) -> None:
         self.scheduler = LRScheduler(self.optimizer, self.config["optim"])
