@@ -63,8 +63,6 @@ dataset:
         energy:
           file: experimental/configs/omat24/mptrj/preprocessing/equiformer_v2_mptrj_energy_element_references.npz
 
-    max_atoms: 24000      # guard: skip giant structures (gradient-force is memory-heavy via double backward)
-
   val:
     format: ase_db
     src:
@@ -116,22 +114,17 @@ outputs:
 loss_functions:
   - energy:
       fn:                 per_atom_mae
-      coefficient:        20     # Both paper and checkpoint use 20 instead of 5
+      coefficient:        5      # CHANGED: E:F:S = 5:10:100 (was 20:20:5)
   - forces:
       fn:                 l2mae
-      coefficient:        20
+      coefficient:        10
   - stress:
       fn:                 mae
-      coefficient:        5
+      coefficient:        100
 
 
 model:
-  #####################################################################################
-  #  Architecture MUST stay identical to the direct-force stage-1 config so that
-  #  load_pretrained_weights can transfer the backbone + energy_block by shape match.
-  #  Only the force-prediction mechanism + regularization/DeNS switches differ.
-  #####################################################################################
-  name:                         equiformer_v3        # CHANGED: was equiformer_v3_dens (no DeNS head in finetune)
+  name:                         equiformer_v3_dens
 
   use_pbc:                      True
   use_pbc_single:               True      # Process batch PBC graphs one at a time.
@@ -140,14 +133,14 @@ model:
 
   regress_forces:               True
   regress_stress:               True
-  direct_prediction:            False     # CHANGED: forces = -dE/dx (conservative), stress from virial
+  direct_prediction:            True
 
   max_neighbors:                300
   max_radius:                   6.0
   num_radial_basis:             10
   max_num_elements:             128
 
-  num_layers:                   2          # identical to direct stage-1
+  num_layers:                   2
   num_channels:                 64
   attn_hidden_channels:         32
   num_heads:                    8
@@ -165,10 +158,7 @@ model:
   use_atom_edge_embedding:      True
   use_envelope:                 True
 
-  attn_activation:              'sep-merge_gates2_swiglu'   # kept same as direct for guaranteed weight transfer.
-                                                            # Official grad recipe uses '..._mem' (param-compatible,
-                                                            # activation-checkpointed) to save memory under double
-                                                            # backward; switch to it if memory-bound.
+  attn_activation:              'sep-merge_gates2_swiglu'
   use_attn_renorm:              True
   use_add_merge:                False
   use_rad_l_parametrization:    True
@@ -180,13 +170,13 @@ model:
 
   alpha_drop:                   0.0
   attn_mask_rate:               0.0
-  attn_weights_drop:            0.0       # CHANGED: drops off for short finetune (was 0.1)
+  attn_weights_drop:            0.1
   value_drop:                   0.0
-  drop_path_rate:               0.0       # CHANGED: was 0.05
+  drop_path_rate:               0.05
   proj_drop:                    0.0
   ffn_drop:                     0.0
 
-  gradient_checkpointing_block_list:    [0, 0]      # length == num_layers; set [1,1] to trade compute for memory
+  gradient_checkpointing_block_list:    [0, 0]
 
   enforce_max_neighbors_strictly:       True
 
@@ -194,18 +184,12 @@ model:
 
 
 optim:
-  #####################################################################################
-  #  Gradient-force = double backward, use_compile off, and MUST run fp32 (no --amp:
-  #  amp crashes Wigner construction in so3.py with a Float/Half index_put mismatch).
-  #  Measured (local fp32 smoke, N@2_L@2_C@64): batch 32 -> 64%, batch 48 -> 82% peak
-  #  on A100-80G. 48 picked as the robust per-GPU value (~14.5GB headroom).
-  #####################################################################################
-  batch_size:                   48      # per-GPU; fp32, ~82% A100-80G (smoke-verified). global = 48 * num_gpu
+  batch_size:                   64      # per-GPU; with 8 GPU -> global 512 (matches native pairing global 512 <-> lr 2e-4)
   grad_accumulation_steps:      1
-  eval_batch_size:              48
+  eval_batch_size:              64
   load_balancing:               atoms
   num_workers:                  0       # lmdb env not fork-safe -> num_workers>0 segfaults
-  lr_initial:                   0.00005 # 5e-5: low lr for finetuning from the direct checkpoint
+  lr_initial:                   0.0002  # 2e-4, native pairing at global 512
 
   optimizer:                    AdamW
   optimizer_params:
@@ -218,13 +202,13 @@ optim:
     warmup_epochs:              0.1
     lr_min_factor:              0.01
 
-  max_epochs:                   2
+  max_epochs:                   15    # stage-1 direct-force pretrain; stage-2 = separate gradient-force finetune (5ep) loading this ckpt
   clip_grad_norm:               100
   ema_decay:                    0.999
 
   eval_every:                   5000
 
-  use_denoising_pos:            False   # CHANGED: no DeNS auxiliary task during finetune
+  use_denoising_pos:            True
   denoising_pos_params:
     prob:                       0.5
     fixed_noise_std:            True
@@ -237,14 +221,4 @@ optim:
     strict_max_ratio:           0.75
   denoising_pos_coefficient:    10
 
-  use_compile:                  False   # CHANGED: torch.compile is unstable with the double backward of gradient forces
-
-  #####################################################################################
-  #  Stage-1 direct-force checkpoint to finetune from. FILL IN after stage-1 finishes.
-  #  Non-strict shape-checked partial load (equiformer_v3_dens_trainer.py:1103-1127):
-  #  backbone + energy_block transfer; direct force/stress/dens heads are auto-skipped.
-  #  Tip: launch stage-1 with `--timestamp-id mptrj_direct_N@2_L@2_C@64_8ep` to make this
-  #  path deterministic (no timestamp prefix). If an energy_block shape assert fires,
-  #  strip energy_block keys from the ckpt first (the official "no-energy_block" trick).
-  #####################################################################################
-  load_pretrained_weights:      /mnt/afs/share/checkpoint/equiformerV3/yaolekai/checkpoints/2026-06-03-07-08-48-mptrj_direct_N@2_L@2_C@64_8ep/best_checkpoint.pt
+  use_compile:                  True

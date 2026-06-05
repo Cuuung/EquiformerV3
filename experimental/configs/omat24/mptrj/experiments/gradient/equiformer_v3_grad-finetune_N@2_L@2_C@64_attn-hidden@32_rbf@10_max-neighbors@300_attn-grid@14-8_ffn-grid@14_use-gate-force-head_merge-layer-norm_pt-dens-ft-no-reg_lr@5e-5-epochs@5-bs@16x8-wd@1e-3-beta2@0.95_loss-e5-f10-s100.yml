@@ -116,13 +116,13 @@ outputs:
 loss_functions:
   - energy:
       fn:                 per_atom_mae
-      coefficient:        20     # Both paper and checkpoint use 20 instead of 5
+      coefficient:        5      # CHANGED: E:F:S = 5:10:100 (was 20:20:5)
   - forces:
       fn:                 l2mae
-      coefficient:        20
+      coefficient:        10
   - stress:
       fn:                 mae
-      coefficient:        5
+      coefficient:        100
 
 
 model:
@@ -197,12 +197,16 @@ optim:
   #####################################################################################
   #  Gradient-force = double backward, use_compile off, and MUST run fp32 (no --amp:
   #  amp crashes Wigner construction in so3.py with a Float/Half index_put mismatch).
-  #  Measured (local fp32 smoke, N@2_L@2_C@64): batch 32 -> 64%, batch 48 -> 82% peak
-  #  on A100-80G. 48 picked as the robust per-GPU value (~14.5GB headroom).
+  #  MEMORY note: per-GPU memory depends on per-GPU batch_size, NOT GPU count -- adding
+  #  GPUs only grows global batch/throughput, it does NOT reduce single-card usage.
+  #  On the real MPtrj train split (large structures, max_atoms 24000, load_balancing
+  #  atoms) batch 32/GPU pushed close to 100% (OOM risk), so per-GPU batch is set to 16
+  #  for headroom. To push higher (24-32) without OOM, enable gradient_checkpointing_
+  #  block_list: [1, 1] above (trades compute for memory).
   #####################################################################################
-  batch_size:                   48      # per-GPU; fp32, ~82% A100-80G (smoke-verified). global = 48 * num_gpu
+  batch_size:                   16      # per-GPU; fp32. with 8 GPU -> global 128. safe headroom vs 32/GPU OOM
   grad_accumulation_steps:      1
-  eval_batch_size:              48
+  eval_batch_size:              16
   load_balancing:               atoms
   num_workers:                  0       # lmdb env not fork-safe -> num_workers>0 segfaults
   lr_initial:                   0.00005 # 5e-5: low lr for finetuning from the direct checkpoint
@@ -218,7 +222,7 @@ optim:
     warmup_epochs:              0.1
     lr_min_factor:              0.01
 
-  max_epochs:                   2
+  max_epochs:                   5
   clip_grad_norm:               100
   ema_decay:                    0.999
 
@@ -243,8 +247,8 @@ optim:
   #  Stage-1 direct-force checkpoint to finetune from. FILL IN after stage-1 finishes.
   #  Non-strict shape-checked partial load (equiformer_v3_dens_trainer.py:1103-1127):
   #  backbone + energy_block transfer; direct force/stress/dens heads are auto-skipped.
-  #  Tip: launch stage-1 with `--timestamp-id mptrj_direct_N@2_L@2_C@64_8ep` to make this
-  #  path deterministic (no timestamp prefix). If an energy_block shape assert fires,
-  #  strip energy_block keys from the ckpt first (the official "no-energy_block" trick).
+  #  This points at the ACTUAL stage-1 run dir (launched with --identifier, so it carries
+  #  a timestamp prefix). Load it only AFTER stage-1 (15ep) finishes. If an energy_block
+  #  shape assert fires, strip energy_block keys from the ckpt first ("no-energy_block").
   #####################################################################################
-  load_pretrained_weights:      /mnt/afs/share/checkpoint/equiformerV3/yaolekai/checkpoints/2026-06-03-07-08-48-mptrj_direct_N@2_L@2_C@64_8ep/best_checkpoint.pt
+  load_pretrained_weights:      /mnt/afs/share/checkpoint/equiformerV3/yaolekai/checkpoints/2026-06-05-02-52-48-mptrj_direct_N@2_L@2_C@64_15ep/best_checkpoint.pt
