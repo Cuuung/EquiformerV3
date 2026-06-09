@@ -192,6 +192,10 @@ optim:
   lr_initial:                   0.0002  # AdamW lr for the NON-matrix params (biases, norms, embeddings)
 
   #####################################################################################
+  #  A/B counterpart of the AdamW config:
+  #    ...epochs@15-bs@64x8-lr@2e-4-wd@1e-3_dens-no-stress_loss-e5-f10-s100.yml
+  #  EVERYTHING is identical except the optimizer block below (and its associated lr).
+  #
   #  HybridMuon: Muon (Newton-Schulz orthogonalized momentum) for the weight matrices
   #  (nn.Linear 2D + SO3Linear 3D), AdamW for biases / norms / embeddings.
   #  - muon_lr is the MAIN knob to tune; Muon updates are ~unit-RMS so the matrix lr is
