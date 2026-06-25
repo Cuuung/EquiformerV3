@@ -451,7 +451,23 @@ class EquiformerV3DeNSTrainer(EquiformerV2ForcesTrainer):
                     loss = loss / self.grad_accumulation_steps
                 self._backward(loss)
                 scale = self.scaler.get_scale() if self.scaler else 1.0
-    
+
+                # AMP's GradScaler halves `scale` on every gradient overflow. A `scale`
+                # that has collapsed to 0 means the run has overflowed for many steps in a
+                # row -- i.e. training has DIVERGED (you'll typically see repeated
+                # "Found nans while computing loss" warnings from loss.py just before this).
+                # The loss-logging line below does `loss.item() / scale`, so without this
+                # guard a *display-only* metric crashes the whole job with an opaque
+                # ZeroDivisionError. Fail fast with an actionable message instead.
+                if scale == 0:
+                    raise RuntimeError(
+                        f"AMP GradScaler scale collapsed to 0 at step {self.step} "
+                        f"(epoch {self.epoch:.3f}): training has diverged (NaN/Inf "
+                        "gradients for many consecutive steps). Lower the learning rate "
+                        "(for HybridMuon, muon_lr) and/or add LR warmup, or reduce the "
+                        "stress-loss weight."
+                    )
+
                 # Compute metrics.
                 self.metrics = self._compute_metrics(
                     out,

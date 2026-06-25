@@ -819,7 +819,17 @@ class BaseTrainer(ABC):
         muon_kwargs = {
             k: v
             for k, v in optimizer_params.items()
-            if k in {"momentum", "nesterov", "ns_steps", "betas", "eps"}
+            if k in {
+                "momentum", "nesterov", "ns_steps", "betas", "eps",
+                # Update-magnitude scaling mode ("ratio" | "moonlight"; see muon.py):
+                "update_scale",
+                # Muon-side divergence-guard knobs (see muon.py HybridMuon.__init__):
+                "skip_nonfinite", "spike_factor", "spike_ema_decay",
+                "spike_warmup_steps", "spike_max_consecutive_skips",
+                # Absolute runaway backstop (sustained network-wide RMS ramp -> abort):
+                "spike_abs_threshold", "spike_abs_max_consecutive",
+                "log_every",
+            }
         }
         self.optimizer = HybridMuon(param_groups, lr=adamw_lr, **muon_kwargs)
 

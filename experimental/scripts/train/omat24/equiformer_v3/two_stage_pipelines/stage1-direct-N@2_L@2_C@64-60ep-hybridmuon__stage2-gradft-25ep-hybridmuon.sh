@@ -22,22 +22,41 @@
 set -euo pipefail
 
 cd /mnt/afs/home/yaolekai/MLIP/equiformer_v3
-# The repo root has NO pyproject.toml/setup.py; the installable package is
-# packages/fairchem-core (its src/ is a symlink to ../../src). Install by that
-# explicit path so it works regardless of cwd (plain `pip install -e .` from the
-# repo root fails: "does not appear to be a Python project").
-pip install -e packages/fairchem-core --no-deps
+
+# --- wandb egress fix: strip any dev-machine proxy leaked from the submit shell --
+# ~/.bashrc's `proxy_on` exports http(s)_proxy=http://127.0.0.1:45889 and
+# all_proxy=socks5h://127.0.0.1:45889 -- a LOOPBACK tunnel that only exists on the
+# LOGIN machine. If `proxy_on` was active when you submitted, the job inherits it,
+# but the compute node's 127.0.0.1:45889 is dead -> wandb's data-plane (file_stream
+# uploads) fails with "unexpected EOF" / Client.Timeout, so the run shows on the web
+# but every panel (incl. System) is empty. Compute nodes reach api.wandb.ai via their
+# own native egress, so just drop the leaked proxy. (Plan B if a node has NO egress:
+# WANDB_MODE=offline here + `wandb sync <run_dir>` from the login server afterward.)
+unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY
+
+# DO NOT pip install: the repo root has NO pyproject.toml, the container python has no pip,
+# and the AdamW-era docker image bakes in an OLD fairchem (no HybridMuon branch) -- which is
+# exactly why `optimizer: HybridMuon` crashed with:
+#   AttributeError: module 'torch.optim' has no attribute 'HybridMuon'
+# The cluster mounts this server into the job, so just point PYTHONPATH at this repo's src.
+# PYTHONPATH is searched before site-packages, so the mounted new code overrides the image's
+# baked-in old fairchem. (Muon needs NO new deps -- pure torch -- so no image rebuild.)
+export PYTHONPATH=/mnt/afs/home/yaolekai/MLIP/equiformer_v3/src:${PYTHONPATH:-}
+# Fail fast if the imported fairchem is STILL the wrong checkout (no HybridMuon branch).
+python -c "import inspect, fairchem.core.trainers.base_trainer as bt; assert 'HybridMuon' in inspect.getsource(bt), 'WRONG fairchem imported (no HybridMuon branch): '+bt.__file__; print('[pipeline] fairchem OK:', bt.__file__)"
 
 ############################## EDIT THESE #####################################
 RUN_DIR='/mnt/afs/share/checkpoint/equiformerV3/yaolekai'
 
 # --- Stage 1: HybridMuon direct-force pretrain (--amp ON) --------------------
-DIRECT_CFG='experimental/configs/omat24/mptrj/experiments/direct/equiformer_v3_N@2_L@2_C@64_rbf@10_attn-grid@14-8_ffn-grid@14_merge-ln_epochs@60-bs@32x16_hybridmuon-mlr@2e-2-alr@2e-4-wd@1e-3_dens-no-stress_loss-e5-f10-s100.yml'
-DIRECT_ID='mptrj_direct_N@2_L@2_C@64_60ep_hybridmuon'
+# CHANGED mlr@2e-2 -> mlr@1e-2 (+warmup@0.5): the 0.02 muon_lr run diverged on 8 GPU
+# (AMP scale collapsed to 0). This stabilized config halves muon_lr and lengthens warmup.
+DIRECT_CFG='experimental/configs/omat24/mptrj/experiments/direct/equiformer_v3_N@2_L@2_C@64_rbf@10_attn-grid@14-8_ffn-grid@14_merge-ln_epochs@60-bs@32x16_hybridmuon-mlr@1e-2-alr@2e-4-wd@1e-3-warmup@0.5_dens-no-stress_loss-e5-f10-s100.yml'
+DIRECT_ID='muon_direct_60ep'
 
 # --- Stage 2: HybridMuon gradient-force finetune (fp32, NO --amp) ------------
 GRADFT_CFG='experimental/configs/omat24/mptrj/experiments/gradient/equiformer_v3_grad-finetune_N@2_L@2_C@64_attn-hidden@32_rbf@10_max-neighbors@300_attn-grid@14-8_ffn-grid@14_use-gate-force-head_merge-layer-norm_pt-dens-ft-no-reg_hybridmuon-mlr@5e-3-alr@5e-5-epochs@25-bs@16x16-wd@1e-3_loss-e5-f10-s100.yml'
-GRADFT_ID='mptrj_grad-ft_N@2_L@2_C@64_25ep_hybridmuon_from-60ep-hybridmuon'
+GRADFT_ID='muon_gradft_25ep'
 ##############################################################################
 
 TORCHRUN_COMMON=(
