@@ -5,7 +5,7 @@ from fairchem.core.common.registry import registry
 from fairchem.core.common.utils import conditional_grad
 from fairchem.core.models.base import GraphModelMixin
 
-from .edge_rot_mat import init_edge_rot_mat
+from .edge_rot_mat import init_edge_rot_euler_angles
 from .envelope import PolynomialEnvelope
 from .so3 import (
     SO3Rotation,
@@ -390,11 +390,11 @@ class EquiformerV3_OC(torch.nn.Module, GraphModelMixin):
         edge_distance, 
         edge_distance_vec
     ):
-        # Compute 3x3 rotation matrix per edge
-        edge_rot_mat = self._init_edge_rot_mat(edge_distance_vec)
+        # Compute Euler angles per edge (UMA Euler path, make_fx-friendly)
+        eulers = self._init_edge_rot_mat(edge_distance_vec)
 
-        # Compute Wigner-D matrices
-        self.so3_rotation.set_wigner(edge_rot_mat)
+        # Compute Wigner-D matrices from Euler angles
+        self.so3_rotation.set_wigner_from_eulers(eulers)
 
         # Envelope function
         edge_envelope_weight = self.envelope_func(edge_distance) if self.envelope_func is not None else None
@@ -668,9 +668,9 @@ class EquiformerV3_OC(torch.nn.Module, GraphModelMixin):
         return outputs
 
 
-    # Initialize the edge rotation matrics
+    # Compute Euler angles for each edge (UMA/esen Euler path, make_fx-friendly)
     def _init_edge_rot_mat(self, edge_distance_vec):
-        return init_edge_rot_mat(edge_distance_vec, use_rotation_mask=(not self.direct_prediction))
+        return init_edge_rot_euler_angles(edge_distance_vec)
 
 
     @property

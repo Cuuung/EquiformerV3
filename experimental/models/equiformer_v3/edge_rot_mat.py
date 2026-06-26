@@ -1,90 +1,98 @@
 import torch
+import torch.nn.functional as F
 
+from .wigner import wigner_D
 
-"""
-    For gradient methods, we do not backpropogate rotation if y component of 
-    the unit vector of relative position is very close to `_ROTATION_MASK_THRESHOLD`.
-"""
+# NOTE (rotation migration, Task 1):
+# Migrated from the Gram-Schmidt + wigner-from-3x3-mat path to the UMA/esen
+# Euler-angle path (fairchem 2.x esen/common/rotation.py). Blockers removed:
+#   - edge_rot_mat.py:17-20  min-distance debug branch (data-dependent → breaks make_fx)
+#   - edge_rot_mat.py:65     assert max(vec_dot) < 0.99  (data-dependent → breaks make_fx)
+#   - so3.py  rot_clip boolean-mask (data-dependent index, use_rotation_mask guard)
+# Gradient stability now comes from the clamped-safe backward of Safeacos/Safeatan2.
+# Verified lossless on a small randomly-initialized V3 backbone (Task-1 gate).
+
+# Kept for backward compatibility: so3.py imports this constant at module level.
 _ROTATION_MASK_THRESHOLD = 0.999999
 
+EPS = 1e-7
 
-def init_edge_rot_mat(edge_distance_vec, use_rotation_mask=False):
-    edge_vec_0 = edge_distance_vec
-    edge_vec_0_distance = torch.sqrt(torch.sum(edge_vec_0**2, dim=1))
 
-    # Make sure the atoms are far enough apart
-    #assert torch.min(edge_vec_0_distance) < 0.0001
-    if torch.min(edge_vec_0_distance) < 0.0001:
-        print(
-            "Error edge_vec_0_distance: {}".format(
-                torch.min(edge_vec_0_distance)
-            )
-        )
+class Safeacos(torch.autograd.Function):
+    """acos with a clamped-safe backward (avoids NaN gradients at |x|->1)."""
 
-    norm_x = edge_vec_0 / (edge_vec_0_distance.view(-1, 1))
+    @staticmethod
+    def forward(ctx, x):
+        x_clamped = x.clamp(-1 + EPS, 1 - EPS)
+        ctx.save_for_backward(x_clamped)
+        return torch.acos(x)
 
-    if use_rotation_mask:
-        """
-            For gradient methods, we do not backpropogate rotation if y component of 
-            the unit vector of relative position is very close to `_ROTATION_MASK_THRESHOLD`.
-        """
-        yprod = norm_x @ norm_x.new_tensor([0.0, 1.0, 0.0])
-        norm_x[yprod >  _ROTATION_MASK_THRESHOLD] = norm_x.new_tensor([0.0,  1.0, 0.0])
-        norm_x[yprod < -_ROTATION_MASK_THRESHOLD] = norm_x.new_tensor([0.0, -1.0, 0.0])
+    @staticmethod
+    def backward(ctx, grad_output):
+        (x_clamped,) = ctx.saved_tensors
+        denom = torch.sqrt(1 - x_clamped.pow(2)).clamp(min=EPS)
+        return -grad_output / denom
 
-    edge_vec_2 = torch.rand_like(edge_vec_0) - 0.5
-    edge_vec_2 = edge_vec_2 / (
-        torch.sqrt(torch.sum(edge_vec_2**2, dim=1)).view(-1, 1)
-    )
-    # Create two rotated copys of the random vectors in case the random vector is aligned with norm_x
-    # With two 90 degree rotated vectors, at least one should not be aligned with norm_x
-    edge_vec_2b = edge_vec_2.clone()
-    edge_vec_2b[:, 0] = -edge_vec_2[:, 1]
-    edge_vec_2b[:, 1] = edge_vec_2[:, 0]
-    edge_vec_2c = edge_vec_2.clone()
-    edge_vec_2c[:, 1] = -edge_vec_2[:, 2]
-    edge_vec_2c[:, 2] = edge_vec_2[:, 1]
-    vec_dot_b = torch.abs(torch.sum(edge_vec_2b * norm_x, dim=1)).view(
-        -1, 1
-    )
-    vec_dot_c = torch.abs(torch.sum(edge_vec_2c * norm_x, dim=1)).view(
-        -1, 1
-    )
 
-    vec_dot = torch.abs(torch.sum(edge_vec_2 * norm_x, dim=1)).view(-1, 1)
-    edge_vec_2 = torch.where(
-        torch.gt(vec_dot, vec_dot_b), edge_vec_2b, edge_vec_2
-    )
-    vec_dot = torch.abs(torch.sum(edge_vec_2 * norm_x, dim=1)).view(-1, 1)
-    edge_vec_2 = torch.where(
-        torch.gt(vec_dot, vec_dot_c), edge_vec_2c, edge_vec_2
-    )
+class Safeatan2(torch.autograd.Function):
+    """atan2 with a clamped-safe backward (avoids NaN gradients at the origin)."""
 
-    vec_dot = torch.abs(torch.sum(edge_vec_2 * norm_x, dim=1))
-    # Check the vectors aren't aligned
-    assert torch.max(vec_dot) < 0.99
+    @staticmethod
+    def forward(ctx, y, x):
+        ctx.save_for_backward(y, x)
+        return torch.atan2(y, x)
 
-    norm_z = torch.cross(norm_x, edge_vec_2, dim=1)
-    norm_z = norm_z / (
-        torch.sqrt(torch.sum(norm_z**2, dim=1, keepdim=True))
-    )
-    norm_z = norm_z / (
-        torch.sqrt(torch.sum(norm_z**2, dim=1)).view(-1, 1)
-    )
-    norm_y = torch.cross(norm_x, norm_z, dim=1)
-    norm_y = norm_y / (
-        torch.sqrt(torch.sum(norm_y**2, dim=1, keepdim=True))
-    )
+    @staticmethod
+    def backward(ctx, grad_output):
+        y, x = ctx.saved_tensors
+        denom = (x.pow(2) + y.pow(2)).clamp(min=EPS)
+        return (x / denom) * grad_output, (-y / denom) * grad_output
 
-    # Construct the 3D rotation matrix
-    norm_x = norm_x.view(-1, 3, 1)
-    norm_y = -norm_y.view(-1, 3, 1)
-    norm_z = norm_z.view(-1, 3, 1)
 
-    edge_rot_mat_inv = torch.cat([norm_z, norm_x, norm_y], dim=2)
-    edge_rot_mat = torch.transpose(edge_rot_mat_inv, 1, 2)
+def init_edge_rot_euler_angles(edge_distance_vec):
+    """Edge direction -> intrinsic Euler angles (alpha, beta, gamma) aligning the
+    edge to +Y, with a random roll (gamma) for SO(2) equivariance during training.
 
-    if use_rotation_mask:
-        return edge_rot_mat
-    else:
-        return edge_rot_mat.detach()
+    make_fx-friendly: F.normalize (eps-safe) + clamp + Safeacos/Safeatan2; no
+    data-dependent branches, no rot_clip boolean-mask.
+    Migrated from fairchem 2.x esen/common/rotation.py::init_edge_rot_euler_angles.
+    """
+    # clamp because under compile, normalize can return >1.0 (pytorch #163082)
+    xyz = F.normalize(edge_distance_vec).clamp(-1.0, 1.0)
+    x, y, z = torch.split(xyz, 1, dim=1)
+    beta = Safeacos.apply(y.squeeze(-1))   # polar angle from Y axis
+    alpha = Safeatan2.apply(x.squeeze(-1), z.squeeze(-1))  # azimuthal in XZ plane
+    gamma = torch.rand_like(alpha) * 2 * torch.pi  # random roll
+    # intrinsic -> extrinsic swap
+    return -gamma, -beta, -alpha
+
+
+def eulers_to_wigner(eulers, start_lmax, end_lmax):
+    """Build the block-diagonal Wigner-D matrix from Euler angles.
+
+    Uses V3's wigner_D (global Jd, no Jd parameter).
+
+    make_fx-friendly: static shapes, no boolean-mask / rot_clip. Gradient
+    stability comes from the clamped-safe backward of Safeacos/Safeatan2.
+    Migrated from fairchem 2.x esen/common/rotation.py::eulers_to_wigner
+    (adapted to V3's wigner_D signature).
+    """
+    alpha, beta, gamma = eulers
+
+    size = int((end_lmax + 1) ** 2) - int((start_lmax) ** 2)
+    # Functional block-diagonal assembly (symbolic / dynamic-shape safe): pad each
+    # Wigner block to (N, size, size) at its diagonal offset and sum. Avoids
+    # torch.zeros(len(alpha), ...) (Python len() forces symbolic edge dim to a
+    # constant) + in-place slice writes that break dynamic=True.
+    wigner = None
+    start = 0
+    for lmax in range(start_lmax, end_lmax + 1):
+        block = wigner_D(lmax, alpha, beta, gamma)  # (N, dl, dl)
+        dl = block.size(-1)
+        end = start + dl
+        # pad last two dims: (left, right, top, bottom)
+        padded = F.pad(block, (start, size - end, start, size - end))
+        wigner = padded if wigner is None else wigner + padded
+        start = end
+
+    return wigner
