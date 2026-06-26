@@ -403,13 +403,16 @@ git commit -m "compile: enable_compile config sample + compile_dev gate README"
 **Interfaces:**
 - Consumes: 本计划全部交付物 + gate 结果。
 
-- [ ] **Step 1: 展开 Stage 4 checklist**
+- [ ] **Step 1: Stage 4 写核心结果概括（简，不堆细节）**
 
-把现有 5 行 checklist 展开为：①环境（复用 .venv-torch211 + PYTHONPATH）②rotation 迁移（file:line + 无损实测数值）③core_compute 抽取（DeNS+非 DeNS 边界）④直接力/守恒力两策略 + stale-bake guard ⑤与 use_compile 互斥接线 ⑥gate 结果（实测数值）⑦dynamic=True 留口现状。每条带 `[x]` + 证据。
+把现有 5 行 checklist 标为完成，**只概括核心结果**：①直接力 + 守恒力(dynamic=False) 已接入并过 gate（附关键实测数值：rotation 无损 / 直接力 err / 守恒力梯度对齐 cos+范数比）②与 `optim.use_compile` 互斥 ③dynamic=True 已留口。**不复制全部细节**，改为指向 ref 路径：
+- 设计：`<equiformer_v3 repo>/docs/superpowers/specs/2026-06-26-equiformer-v3-torch-compile-design.md`
+- 计划：`<equiformer_v3 repo>/docs/superpowers/plans/2026-06-26-equiformer-v3-torch-compile.md`
+- gate 脚本：`<equiformer_v3 repo>/compile_dev/`
 
-- [ ] **Step 2: 标注 V3 与 eSEN 的差异**
+- [ ] **Step 2: 一句话标注 V3 与 eSEN 的关键差异**
 
-记录关键差异：V3 `autograd.grad` 已在 model 内（`_forward_gradient`）→ 守恒力天然 DDP 安全，不需 esen 的 head 挂载；V3 有现成 `optim.use_compile`（直接力），需互斥。
+V3 `autograd.grad` 已在 model 内（`_forward_gradient`）→ 守恒力天然 DDP 安全，不需 esen 的 head 挂载；V3 有现成 `optim.use_compile`（直接力），需互斥。（一两句即可，细节见上方 ref。）
 
 - [ ] **Step 3: Commit（在 esen repo）**
 
