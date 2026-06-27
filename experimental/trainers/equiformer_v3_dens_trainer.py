@@ -376,10 +376,28 @@ class EquiformerV3DeNSTrainer(EquiformerV2ForcesTrainer):
         )
         self.normalizers["denoising_pos_target"].to(self.device)
 
-        if self.config['optim'].get('use_compile', False):
+        self._setup_compile()
+
+    def _setup_compile(self):
+        """Mutually-exclusive compile dispatch.
+
+        - ``optim.use_compile`` (outer torch.compile) and
+          ``model.enable_compile`` (in-model make_fx region) conflict when
+          both are enabled: the outer retrace collides with the
+          already-make_fx-compiled inner region.
+        - Exactly one (or neither) may be set.
+        """
+        enable_compile = self.config.get('model', {}).get('enable_compile', False)
+        use_compile = self.config['optim'].get('use_compile', False)
+        if use_compile and enable_compile:
+            raise ValueError(
+                "optim.use_compile (outer torch.compile) 与 model.enable_compile "
+                "(in-model make_fx) 互斥，不能同开。二选一。")
+        if use_compile and not enable_compile:
             self.model = torch.compile(self.model, dynamic=True)
             torch._dynamo.config.optimize_ddp = False
-
+        elif enable_compile:
+            torch._dynamo.config.optimize_ddp = False
 
     def train(self, disable_eval_tqdm=False):
         ensure_fitted(self._unwrapped_model, warn=True)
