@@ -179,6 +179,9 @@ class EquiformerV3_OC(torch.nn.Module, GraphModelMixin):
         avg_degree=_AVG_DEGREE,
 
         enforce_max_neighbors_strictly=True,
+
+        enable_compile: bool = False,
+        compile_dynamic: bool = False,
     ):
         super().__init__()
 
@@ -384,6 +387,11 @@ class EquiformerV3_OC(torch.nn.Module, GraphModelMixin):
                 
         self.apply(self._init_weights)
 
+        self.enable_compile = enable_compile
+        self.compile_dynamic = compile_dynamic
+        self._compiled_core = None
+        self._compiled_region = None
+
 
     def _forward_edge(
         self, 
@@ -483,7 +491,40 @@ class EquiformerV3_OC(torch.nn.Module, GraphModelMixin):
         x_scalar = x.narrow(1, 0, 1)
         x_scalar = x_scalar.view(x_scalar.shape[0], self.num_channels)
         return x_scalar, x
-        
+
+
+    def core_compute(
+        self,
+        atomic_numbers,
+        edge_distance,
+        edge_distance_vec,
+        edge_index,
+        batch,
+    ):
+        """Pure tensor-in / tensor-out compute body.
+
+        Takes RAW (pre-expansion) edge_distance plus edge_distance_vec and
+        returns node embeddings. The pos-dependent rotation/Wigner-D setup
+        (_forward_edge) lives INSIDE this method so the whole pos->Wigner->
+        embedding->blocks chain is captured when this body is traced/compiled
+        (Task 4 conservative force). Energy aggregation and force/stress heads
+        remain in the callers.
+        """
+        edge_distance, edge_envelope_weight = self._forward_edge(edge_distance, edge_distance_vec)
+        source_atomic_numbers = atomic_numbers[edge_index[0]]
+        target_atomic_numbers = atomic_numbers[edge_index[1]]
+        x = self._forward_embedding(atomic_numbers, edge_distance, edge_index, edge_envelope_weight)
+        x_scalar, x = self._forward_blocks(
+            x,
+            source_atomic_numbers,
+            target_atomic_numbers,
+            edge_distance,
+            edge_index,
+            edge_envelope_weight,
+            batch,
+        )
+        return x_scalar, x
+
 
     def _forward_direct(self, data):
         self.batch_size = len(data.natoms)
@@ -507,17 +548,16 @@ class EquiformerV3_OC(torch.nn.Module, GraphModelMixin):
         source_atomic_numbers = atomic_numbers[edge_index[0]]
         target_atomic_numbers = atomic_numbers[edge_index[1]]
 
-        edge_distance, edge_envelope_weight = self._forward_edge(edge_distance, edge_distance_vec)
-        x = self._forward_embedding(atomic_numbers, edge_distance, edge_index, edge_envelope_weight)
-        x_scalar, x = self._forward_blocks(
-            x,
-            source_atomic_numbers, 
-            target_atomic_numbers, 
-            edge_distance, 
+        x_scalar, x = self.core_compute(
+            atomic_numbers,
+            edge_distance,
+            edge_distance_vec,
             edge_index,
-            edge_envelope_weight,
-            data.batch
+            data.batch,
         )
+        # Re-expand edge features for the eager prediction heads (core_compute
+        # consumed the raw distance internally and returns only embeddings).
+        edge_distance, edge_envelope_weight = self._forward_edge(edge_distance, edge_distance_vec)
 
         outputs = {}
 
@@ -541,7 +581,7 @@ class EquiformerV3_OC(torch.nn.Module, GraphModelMixin):
             forces = forces.narrow(1, 1, 3)
             forces = forces.view(-1, 3)
             outputs['forces'] = forces
-        
+
         # Stress Prediction
         if self.regress_stress:
             stress = self.stress_block(
@@ -550,9 +590,9 @@ class EquiformerV3_OC(torch.nn.Module, GraphModelMixin):
                 batch=data.batch
             )
             outputs['stress'] = stress
-                
+
         return outputs
-    
+
 
     @conditional_grad(torch.enable_grad())
     def _forward_gradient(self, data):
@@ -608,19 +648,13 @@ class EquiformerV3_OC(torch.nn.Module, GraphModelMixin):
         )
 
         atomic_numbers = data.atomic_numbers.long()
-        source_atomic_numbers = atomic_numbers[edge_index[0]]
-        target_atomic_numbers = atomic_numbers[edge_index[1]]
 
-        edge_distance, edge_envelope_weight = self._forward_edge(edge_distance, edge_distance_vec)
-        x = self._forward_embedding(atomic_numbers, edge_distance, edge_index, edge_envelope_weight)
-        x_scalar, x = self._forward_blocks(
-            x,
-            source_atomic_numbers, 
-            target_atomic_numbers, 
-            edge_distance, 
+        x_scalar, x = self.core_compute(
+            atomic_numbers,
+            edge_distance,
+            edge_distance_vec,
             edge_index,
-            edge_envelope_weight,
-            data.batch
+            data.batch,
         )
 
         outputs = {}

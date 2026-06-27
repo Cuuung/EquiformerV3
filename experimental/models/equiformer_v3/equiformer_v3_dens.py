@@ -156,10 +156,13 @@ class EquiformerV3DeNS_OC(EquiformerV3_OC):
         avg_degree=_AVG_DEGREE,
 
         enforce_max_neighbors_strictly=True,
+
+        enable_compile: bool = False,
+        compile_dynamic: bool = False,
     ):
         super().__init__(
             use_pbc,
-            use_pbc_single, 
+            use_pbc_single,
             otf_graph,
 
             regress_forces,
@@ -179,12 +182,12 @@ class EquiformerV3DeNS_OC(EquiformerV3_OC):
             attn_value_channels,
             ffn_hidden_channels,
             norm_type,
-            
+
             lmax,
             mmax,
             attn_grid_resolution_list,
             ffn_grid_resolution_list,
-            
+
             edge_channels,
             use_atom_edge_embedding,
             use_envelope,
@@ -199,7 +202,7 @@ class EquiformerV3DeNS_OC(EquiformerV3_OC):
             use_grid_mlp,
 
             use_gate_force_head,
-            
+
             alpha_drop,
             attn_mask_rate,
             attn_weights_drop,
@@ -208,13 +211,16 @@ class EquiformerV3DeNS_OC(EquiformerV3_OC):
             proj_drop,
             ffn_drop,
             use_head_reg,
-            
+
             gradient_checkpointing_block_list,
 
             avg_num_nodes,
             avg_degree,
 
             enforce_max_neighbors_strictly,
+
+            enable_compile,
+            compile_dynamic,
         )
 
         # Force encoding
@@ -260,6 +266,41 @@ class EquiformerV3DeNS_OC(EquiformerV3_OC):
         self.apply(self._init_weights)
 
 
+    def core_compute(
+        self,
+        atomic_numbers,
+        edge_distance,
+        edge_distance_vec,
+        edge_index,
+        batch,
+        force_embedding,
+    ):
+        """Pure tensor-in / tensor-out compute body (DeNS variant).
+
+        Like the base core_compute (takes RAW edge_distance + edge_distance_vec
+        and runs _forward_edge internally so pos->Wigner is captured when
+        traced/compiled) but adds force_embedding to the node embedding before
+        the transformer blocks. The caller provides force_embedding (from
+        _forward_dens_force_encoding). Energy aggregation and force/stress/dens
+        heads remain in the callers.
+        """
+        edge_distance, edge_envelope_weight = self._forward_edge(edge_distance, edge_distance_vec)
+        source_atomic_numbers = atomic_numbers[edge_index[0]]
+        target_atomic_numbers = atomic_numbers[edge_index[1]]
+        x = self._forward_embedding(atomic_numbers, edge_distance, edge_index, edge_envelope_weight)
+        x = x + force_embedding
+        x_scalar, x = self._forward_blocks(
+            x,
+            source_atomic_numbers,
+            target_atomic_numbers,
+            edge_distance,
+            edge_index,
+            edge_envelope_weight,
+            batch,
+        )
+        return x_scalar, x
+
+
     def _forward_direct(self, data):
         self.batch_size = len(data.natoms)
         self.dtype = data.pos.dtype
@@ -282,19 +323,18 @@ class EquiformerV3DeNS_OC(EquiformerV3_OC):
         source_atomic_numbers = atomic_numbers[edge_index[0]]
         target_atomic_numbers = atomic_numbers[edge_index[1]]
 
-        edge_distance, edge_envelope_weight = self._forward_edge(edge_distance, edge_distance_vec)
-        x = self._forward_embedding(atomic_numbers, edge_distance, edge_index, edge_envelope_weight)
         force_embedding, noise_mask_tensor, dens_batch_mask_tensor, dens_mask_tensor = self._forward_dens_force_encoding(data)
-        x = x + force_embedding
-        x_scalar, x = self._forward_blocks(
-            x,
-            source_atomic_numbers, 
-            target_atomic_numbers, 
-            edge_distance, 
+        x_scalar, x = self.core_compute(
+            atomic_numbers,
+            edge_distance,
+            edge_distance_vec,
             edge_index,
-            edge_envelope_weight,
-            data.batch
+            data.batch,
+            force_embedding,
         )
+        # Re-expand edge features for the eager prediction heads (core_compute
+        # consumed the raw distance internally and returns only embeddings).
+        edge_distance, edge_envelope_weight = self._forward_edge(edge_distance, edge_distance_vec)
 
         outputs = {}
 
@@ -317,7 +357,7 @@ class EquiformerV3DeNS_OC(EquiformerV3_OC):
             )
             forces = forces.narrow(1, 1, 3)
             forces = forces.view(-1, 3)
-            
+
             # for DeNS
             denoising_pos_vec = self.dens_block(
                 x,
@@ -329,7 +369,7 @@ class EquiformerV3DeNS_OC(EquiformerV3_OC):
             )
             denoising_pos_vec = denoising_pos_vec.narrow(1, 1, 3)
             denoising_pos_vec = denoising_pos_vec.view(-1, 3)
-        
+
             outputs['forces'] = forces * (~noise_mask_tensor) + denoising_pos_vec * noise_mask_tensor
         
         # Stress Prediction
@@ -401,19 +441,18 @@ class EquiformerV3DeNS_OC(EquiformerV3_OC):
         source_atomic_numbers = atomic_numbers[edge_index[0]]
         target_atomic_numbers = atomic_numbers[edge_index[1]]
 
-        edge_distance, edge_envelope_weight = self._forward_edge(edge_distance, edge_distance_vec)
-        x = self._forward_embedding(atomic_numbers, edge_distance, edge_index, edge_envelope_weight)
         force_embedding, noise_mask_tensor, dens_batch_mask_tensor, dens_mask_tensor = self._forward_dens_force_encoding(data)
-        x = x + force_embedding
-        x_scalar, x = self._forward_blocks(
-            x,
-            source_atomic_numbers, 
-            target_atomic_numbers, 
-            edge_distance, 
+        x_scalar, x = self.core_compute(
+            atomic_numbers,
+            edge_distance,
+            edge_distance_vec,
             edge_index,
-            edge_envelope_weight,
-            data.batch
+            data.batch,
+            force_embedding,
         )
+        # Re-expand edge features for the eager DeNS denoising head (core_compute
+        # consumed the raw distance internally and returns only embeddings).
+        edge_distance, edge_envelope_weight = self._forward_edge(edge_distance, edge_distance_vec)
 
         outputs = {}
 
