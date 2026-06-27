@@ -548,7 +548,13 @@ class EquiformerV3_OC(torch.nn.Module, GraphModelMixin):
         source_atomic_numbers = atomic_numbers[edge_index[0]]
         target_atomic_numbers = atomic_numbers[edge_index[1]]
 
-        x_scalar, x = self.core_compute(
+        compute = self.core_compute
+        if self.enable_compile:
+            if self._compiled_core is None:
+                from fairchem.core.common.compile_utils import plain_compile
+                self._compiled_core = plain_compile(self.core_compute, dynamic=self.compile_dynamic)
+            compute = self._compiled_core
+        x_scalar, x = compute(
             atomic_numbers,
             edge_distance,
             edge_distance_vec,
