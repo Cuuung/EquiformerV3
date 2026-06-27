@@ -372,7 +372,7 @@ git commit -m "compile: mutually-exclusive enable_compile vs optim.use_compile +
 
 - [ ] **Step 1: 加 config 样例**
 
-复制一个现有 muon 直接力 config，在 `model.backbone` 下加 `enable_compile: True`、`compile_dynamic: False`，文件名加 `-compile` 后缀。
+复制一个现有 muon 直接力 config，在 **`model`** 下（**不是** `model.backbone`——Task 5 实测 V3 用 `**model_config` 直接展开给模型构造函数，无 backbone 子 key，真实路径是 `model.enable_compile`）加 `enable_compile: True`、`compile_dynamic: False`，文件名加 `-compile` 后缀。
 
 - [ ] **Step 2: 写 compile_dev/README.md**
 
