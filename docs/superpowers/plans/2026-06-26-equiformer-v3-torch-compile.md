@@ -162,9 +162,11 @@ git commit -m "compile: migrate edge_rot_mat to UMA Euler (make_fx-clean, lossle
 - Create: `compile_dev/verify_core_compute_refactor.py`
 
 **Interfaces:**
-- Produces (DeNS): `core_compute(atomic_numbers_src, atomic_numbers_tgt, edge_distance, edge_distance_vec, edge_index, edge_envelope_weight, batch, force_embedding) -> energy`（纯 tensor 进出）。
+- Produces (DeNS): `core_compute(atomic_numbers_src, atomic_numbers_tgt, edge_distance, edge_distance_vec, edge_index, edge_envelope_weight, batch, force_embedding) -> (x_scalar, x)`（纯 tensor 进出，返回 `_forward_blocks` 的两个 embedding 输出）。
 - Produces (非 DeNS): `core_compute(...)` 同上但**无** `force_embedding` 参数。
+- **边界定论（重要，对齐 esen）**：`core_compute` 返回**节点 embedding `(x_scalar, x)`，不是 energy**。理由：energy 只是其中一个 head——直接力 `force_block(x)`/`stress_block(x)`、DeNS `dens_block(x)` 都需要完整 `x`；守恒力则 `energy=energy_block(x_scalar)→autograd.grad`。返回 energy 会让直接力/denoising 拿不到 `x`（这正是早期实现被迫上副作用缓存的原因）。esen `core_compute` 同样返回 `self.norm(x_message)`（embedding）。caller 各自从 `(x_scalar, x)` 算 energy/forces。
 - Produces: ctor 新增 `enable_compile: bool=False`, `compile_dynamic: bool=False`；实例属性 `self.enable_compile/self.compile_dynamic/self._compiled_core=None/self._compiled_region=None`。
+- **energy 聚合留在 caller**（对齐 esen：core_compute 只到 embedding 为止）：`energy_block(x_scalar)` + `index_add` 写在 `_forward_gradient`/`_forward_direct` 里，**不进 core_compute**。这样 core_compute 不碰 `self.batch_size`/num_graphs，天然纯 tensor。Task 4 守恒力编译时，把 `core_compute + energy_block + index_add` 一起包进 core_fn 闭包（caller 构造）。本任务照搬原 energy 聚合写法（用 `self.batch_size`，eager），放 caller。
 
 - [ ] **Step 1: 写重构无损 gate（先记录重构前输出）**
 
@@ -277,7 +279,7 @@ Expected: 先失败（enable_compile 守恒力未接线）。
 
 - [ ] **Step 2: 接 CompiledForceRegion（DeNS）**
 
-`_forward_gradient` 内，`enable_compile=True` 时，把 `pos(+displacement)→core_compute→energy` 包成 `core_fn` 闭包（**显式输入**：pos, displacement, edge_index, src_an, tgt_an, edge_distance, edge_distance_vec, edge_envelope_weight, batch, force_embedding），用 `self._compiled_region = CompiledForceRegion(dynamic=self.compile_dynamic, optimize_ddp=False)`，再在外层做 `autograd.grad`。蓝图 = esen `esen_dens.py::MLP_EFS_Head._conservative_compiled_forward`。
+`_forward_gradient` 内，`enable_compile=True` 时，把 `pos(+displacement)→core_compute→energy_block→index_add→energy` 包成 `core_fn` 闭包（core_compute 返回 `(x_scalar, x)`，闭包内接 `energy=energy_block(x_scalar)` 聚合成标量能量；**显式输入**：pos, displacement, edge_index, src_an, tgt_an, edge_distance, edge_distance_vec, edge_envelope_weight, batch, force_embedding），用 `self._compiled_region = CompiledForceRegion(dynamic=self.compile_dynamic, optimize_ddp=False)`，再在外层做 `autograd.grad`。**DeNS denoising（`dens_block(x)`）留 eager**，编译时单独用一次 eager core_compute 取 `x`（brief §4.3 已述）。蓝图 = esen `esen_dens.py::MLP_EFS_Head._conservative_compiled_forward`。
 
 > 注意 stale-bake guard：每批变化张量必须是 core_fn 显式参数，闭包只留 live module 引用。
 
