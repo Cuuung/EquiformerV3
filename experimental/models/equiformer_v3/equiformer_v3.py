@@ -603,9 +603,12 @@ class EquiformerV3_OC(torch.nn.Module, GraphModelMixin):
     @conditional_grad(torch.enable_grad())
     def _forward_gradient(self, data):
         """
-            1.  We have additional `@conditional_grad` as the decorator since the decorator might not be compatible with 
+            1.  We have additional `@conditional_grad` as the decorator since the decorator might not be compatible with
                 `torch.compile()` in direct methods.
         """
+        if self.enable_compile:
+            return self._conservative_compiled_forward(data)
+
         self.batch_size = len(data.natoms)
         self.dtype = data.pos.dtype
         self.device = data.pos.device
@@ -698,7 +701,141 @@ class EquiformerV3_OC(torch.nn.Module, GraphModelMixin):
             outputs['forces'] = forces
 
         return outputs
-    
+
+
+    def _conservative_compiled_forward(self, data):
+        """make_fx-compiled conservative force/stress (Task 4, base / non-DeNS).
+
+        Builds a pure tensor-in/out ``core_fn`` over the differentiated leaves
+        (pos, and displacement when regress_stress) plus the per-batch graph
+        tensors, then runs it through the shared CompiledForceRegion (make_fx ->
+        strip_detach -> rebuild -> inductor, per-shape cached). The WHOLE
+        pos -> edv -> Wigner -> energy -> autograd.grad double-backward lives
+        inside the traced region. Neighbor-list construction (generate_graph)
+        stays eager; it only supplies the (non-differentiated) connectivity
+        edge_index / cell_offsets.
+
+        Stale-bake guard: EVERY per-batch tensor (atomic_numbers, edge_index,
+        cell_offsets, cell, batch) is an explicit core_fn input — NOT a closure
+        capture — so a same-shape batch reuses the cached graph with fresh data.
+        Only live module refs (self.core_compute, self.energy_block, whose params
+        update in place) stay in the closure. DeNS twin lives in
+        equiformer_v3_dens.py (core_compute there takes a force_embedding arg).
+        """
+        from fairchem.core.common.compile_utils import (
+            CompiledForceRegion,
+            make_prime_graph_example,
+        )
+
+        self.batch_size = len(data.natoms)
+        self.dtype = data.pos.dtype
+        self.device = data.pos.device
+
+        # Eager (non-differentiated) graph construction on the UN-perturbed pos.
+        # displacement is identically zero at the perturbation point, so the
+        # connectivity here matches what the perturbed pos would yield; the
+        # region recomputes edge geometry from pos so forces/stress are exact.
+        (
+            edge_index,
+            edge_distance,
+            edge_distance_vec,
+            cell_offsets,
+            _,
+            neighbors,
+        ) = self.generate_graph(
+            data,
+            enforce_max_neighbors_strictly=self.enforce_max_neighbors_strictly,
+            use_pbc_single=self.use_pbc_single,
+        )
+
+        energy_block = self.energy_block
+        avg_num_nodes = self.avg_num_nodes
+
+        def _energy(pos_p, cell_p, an, ei, co, batch, n_sys):
+            # symbolic-safe forms (identical numerics for dynamic=False, required
+            # for dynamic=True): index_select instead of advanced indexing (the
+            # latter silently truncates the 2nd-order grad under symbolic trace),
+            # and reshape co off ei.shape[1] so the edge dim stays symbolic.
+            co = co.reshape(ei.shape[1], -1)
+            src, dst = ei[0], ei[1]
+            cell_e = cell_p.index_select(0, batch.index_select(0, src))
+            shifts = torch.einsum("ej,ejk->ek", co, cell_e)
+            edv = pos_p.index_select(0, src) - pos_p.index_select(0, dst) + shifts
+            ed = torch.linalg.norm(edv, dim=-1)
+            x_scalar, _x = self.core_compute(an, ed, edv, ei, batch)
+            node_e = energy_block(x_scalar).view(-1)
+            energy = torch.zeros(n_sys, device=node_e.device, dtype=node_e.dtype)
+            energy.index_add_(0, batch, node_e)
+            energy = energy / avg_num_nodes
+            return energy
+
+        def core_fn_stress(pos, disp, an, ei, co, cell, batch):
+            sym = 0.5 * (disp + disp.transpose(-1, -2))
+            pos_p = pos + torch.bmm(
+                pos.unsqueeze(-2), torch.index_select(sym, 0, batch)
+            ).squeeze(-2)
+            cell_p = cell + torch.bmm(cell, sym)
+            energy = _energy(pos_p, cell_p, an, ei, co, batch, cell.shape[0])
+            grads = torch.autograd.grad([energy.sum()], [pos, disp], create_graph=True)
+            forces = torch.neg(grads[0])
+            virial = grads[1].view(-1, 3, 3)
+            volume = torch.det(cell).abs().unsqueeze(-1)
+            stress = (virial / volume.view(-1, 1, 1)).view(-1, 9)
+            return energy, forces, stress
+
+        def core_fn_force(pos, an, ei, co, cell, batch):
+            energy = _energy(pos, cell, an, ei, co, batch, cell.shape[0])
+            forces = torch.neg(
+                torch.autograd.grad(energy.sum(), pos, create_graph=True)[0]
+            )
+            return energy, forces
+
+        if self._compiled_region is None:
+            self._compiled_region = CompiledForceRegion(
+                dynamic=self.compile_dynamic, optimize_ddp=False
+            )
+
+        dtype = data.pos.dtype
+        an = data.atomic_numbers.long()
+        ei = edge_index
+        co = cell_offsets.to(dtype)
+        cell = data.cell.to(dtype)
+        batch = data.batch
+        # Differentiate a FRESH leaf: any prior autograd history on data.pos must
+        # not leak into the traced region (a 2nd backward would hit freed saved
+        # tensors).
+        pos = data.pos.detach().requires_grad_(True)
+
+        dyn = self.compile_dynamic
+        outputs = {}
+        if self.regress_stress and self.regress_forces:
+            disp = torch.zeros(
+                (cell.shape[0], 3, 3), device=pos.device, dtype=dtype
+            ).requires_grad_(True)
+            energy, forces, stress = self._compiled_region(
+                core_fn_stress,
+                (pos, disp, an, ei, co, cell, batch),
+                trace_example=make_prime_graph_example(pos.device, dtype, stress=True)
+                if dyn else None,
+                dynamic_dims=[(pos, [0]), (disp, [0]), (an, [0]), (ei, [1]),
+                              (co, [0]), (cell, [0]), (batch, [0])] if dyn else None,
+            )
+            outputs['energy'] = energy
+            outputs['forces'] = forces
+            outputs['stress'] = stress
+        elif self.regress_forces:
+            energy, forces = self._compiled_region(
+                core_fn_force,
+                (pos, an, ei, co, cell, batch),
+                trace_example=make_prime_graph_example(pos.device, dtype, stress=False)
+                if dyn else None,
+                dynamic_dims=[(pos, [0]), (an, [0]), (ei, [1]), (co, [0]),
+                              (cell, [0]), (batch, [0])] if dyn else None,
+            )
+            outputs['energy'] = energy
+            outputs['forces'] = forces
+        return outputs
+
 
     def forward(self, data):
         if self.direct_prediction:

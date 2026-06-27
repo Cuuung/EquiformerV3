@@ -393,9 +393,12 @@ class EquiformerV3DeNS_OC(EquiformerV3_OC):
     @conditional_grad(torch.enable_grad())
     def _forward_gradient(self, data):
         """
-            1.  We have additional `@conditional_grad` as the decorator since the decorator might not be compatible with 
+            1.  We have additional `@conditional_grad` as the decorator since the decorator might not be compatible with
                 `torch.compile()` in direct methods.
         """
+        if self.enable_compile:
+            return self._conservative_compiled_forward(data)
+
         self.batch_size = len(data.natoms)
         self.dtype = data.pos.dtype
         self.device = data.pos.device
@@ -506,6 +509,174 @@ class EquiformerV3DeNS_OC(EquiformerV3_OC):
             denoising_pos_vec = denoising_pos_vec.narrow(1, 1, 3)
             denoising_pos_vec = denoising_pos_vec.view(-1, 3)
             outputs['forces'] = forces * (~noise_mask_tensor) + denoising_pos_vec * noise_mask_tensor # not predict forces during DeNS
+
+        return outputs
+
+
+    def _conservative_compiled_forward(self, data):
+        """make_fx-compiled conservative force/stress (Task 4, DeNS variant).
+
+        DeNS twin of EquiformerV3_OC._conservative_compiled_forward. The whole
+        pos -> edv -> Wigner -> energy -> autograd.grad double-backward runs
+        inside the traced region (CompiledForceRegion: make_fx -> strip_detach
+        -> rebuild -> inductor, per-shape cached). The DeNS denoising head
+        (dens_block) stays EAGER — when enable_compile we run one extra eager
+        core_compute to get the equivariant feature ``x`` it needs.
+
+        Stale-bake guard: every per-batch tensor (atomic_numbers, edge_index,
+        cell_offsets, cell, batch, force_embedding) is an explicit core_fn input,
+        NOT a closure capture. force_embedding is computed eagerly (it is constant
+        wrt pos) and passed in as ``fe``; the traced region stays differentiable
+        wrt fe, so the SO3Linear force_embedding's params still receive gradients
+        through the outer backward. Only live module refs (self.core_compute,
+        self.energy_block) stay in the closure.
+        """
+        from fairchem.core.common.compile_utils import (
+            CompiledForceRegion,
+            make_prime_graph_example,
+        )
+
+        self.batch_size = len(data.natoms)
+        self.dtype = data.pos.dtype
+        self.device = data.pos.device
+
+        (
+            edge_index,
+            edge_distance,
+            edge_distance_vec,
+            cell_offsets,
+            _,
+            neighbors,
+        ) = self.generate_graph(
+            data,
+            enforce_max_neighbors_strictly=self.enforce_max_neighbors_strictly,
+            use_pbc_single=self.use_pbc_single,
+        )
+
+        atomic_numbers = data.atomic_numbers.long()
+        source_atomic_numbers = atomic_numbers[edge_index[0]]
+        target_atomic_numbers = atomic_numbers[edge_index[1]]
+
+        force_embedding, noise_mask_tensor, dens_batch_mask_tensor, dens_mask_tensor = \
+            self._forward_dens_force_encoding(data)
+
+        energy_block = self.energy_block
+        avg_num_nodes = self.avg_num_nodes
+
+        def _energy(pos_p, cell_p, an, ei, co, batch, fe, n_sys):
+            co = co.reshape(ei.shape[1], -1)
+            src, dst = ei[0], ei[1]
+            cell_e = cell_p.index_select(0, batch.index_select(0, src))
+            shifts = torch.einsum("ej,ejk->ek", co, cell_e)
+            edv = pos_p.index_select(0, src) - pos_p.index_select(0, dst) + shifts
+            ed = torch.linalg.norm(edv, dim=-1)
+            x_scalar, _x = self.core_compute(an, ed, edv, ei, batch, fe)
+            node_e = energy_block(x_scalar).view(-1)
+            energy = torch.zeros(n_sys, device=node_e.device, dtype=node_e.dtype)
+            energy.index_add_(0, batch, node_e)
+            energy = energy / avg_num_nodes
+            return energy
+
+        def core_fn_stress(pos, disp, an, ei, co, cell, batch, fe):
+            sym = 0.5 * (disp + disp.transpose(-1, -2))
+            pos_p = pos + torch.bmm(
+                pos.unsqueeze(-2), torch.index_select(sym, 0, batch)
+            ).squeeze(-2)
+            cell_p = cell + torch.bmm(cell, sym)
+            energy = _energy(pos_p, cell_p, an, ei, co, batch, fe, cell.shape[0])
+            grads = torch.autograd.grad([energy.sum()], [pos, disp], create_graph=True)
+            forces = torch.neg(grads[0])
+            virial = grads[1].view(-1, 3, 3)
+            volume = torch.det(cell).abs().unsqueeze(-1)
+            stress = (virial / volume.view(-1, 1, 1)).view(-1, 9)
+            return energy, forces, stress
+
+        def core_fn_force(pos, an, ei, co, cell, batch, fe):
+            energy = _energy(pos, cell, an, ei, co, batch, fe, cell.shape[0])
+            forces = torch.neg(
+                torch.autograd.grad(energy.sum(), pos, create_graph=True)[0]
+            )
+            return energy, forces
+
+        if self._compiled_region is None:
+            self._compiled_region = CompiledForceRegion(
+                dynamic=self.compile_dynamic, optimize_ddp=False
+            )
+
+        dtype = data.pos.dtype
+        an = atomic_numbers
+        ei = edge_index
+        co = cell_offsets.to(dtype)
+        cell = data.cell.to(dtype)
+        batch = data.batch
+        fe = force_embedding
+        pos = data.pos.detach().requires_grad_(True)
+
+        dyn = self.compile_dynamic
+
+        def _prime(stress):
+            # dynamic=True only: append a prime force_embedding leaf so the trace
+            # example matches the real (pos[,disp],an,ei,co,cell,batch,fe) layout.
+            pe = make_prime_graph_example(pos.device, dtype, stress=stress)
+            fe_p = torch.zeros(pe[0].shape[0], *fe.shape[1:], device=pos.device, dtype=dtype)
+            return (*pe, fe_p)
+
+        outputs = {}
+        if self.regress_stress and self.regress_forces:
+            disp = torch.zeros(
+                (cell.shape[0], 3, 3), device=pos.device, dtype=dtype
+            ).requires_grad_(True)
+            energy, forces, stress = self._compiled_region(
+                core_fn_stress,
+                (pos, disp, an, ei, co, cell, batch, fe),
+                trace_example=_prime(True) if dyn else None,
+                dynamic_dims=[(pos, [0]), (disp, [0]), (an, [0]), (ei, [1]),
+                              (co, [0]), (cell, [0]), (batch, [0]), (fe, [0])] if dyn else None,
+            )
+            outputs['energy'] = energy
+            outputs['forces'] = forces
+            # stress not predicted during DeNS (per-system mask), eager outside region
+            outputs['stress'] = stress * (~dens_batch_mask_tensor)
+        elif self.regress_forces:
+            energy, forces = self._compiled_region(
+                core_fn_force,
+                (pos, an, ei, co, cell, batch, fe),
+                trace_example=_prime(False) if dyn else None,
+                dynamic_dims=[(pos, [0]), (an, [0]), (ei, [1]), (co, [0]),
+                              (cell, [0]), (batch, [0]), (fe, [0])] if dyn else None,
+            )
+            outputs['energy'] = energy
+            outputs['forces'] = forces
+
+        # DeNS denoising stays EAGER: one extra eager core_compute gives the
+        # equivariant feature x for dens_block. Mirrors the eager _forward_gradient
+        # force/denoising combination exactly (same noise mask), so dens_block /
+        # backbone gradients via this path are identical eager-vs-compiled.
+        if self.regress_forces:
+            _x_scalar, x = self.core_compute(
+                atomic_numbers,
+                edge_distance,
+                edge_distance_vec,
+                edge_index,
+                data.batch,
+                force_embedding,
+            )
+            edge_distance_exp, edge_envelope_weight = self._forward_edge(
+                edge_distance, edge_distance_vec
+            )
+            denoising_pos_vec = self.dens_block(
+                x,
+                source_atomic_numbers,
+                target_atomic_numbers,
+                edge_distance_exp,
+                edge_index,
+                edge_envelope_weight,
+            )
+            denoising_pos_vec = denoising_pos_vec.narrow(1, 1, 3).view(-1, 3)
+            outputs['forces'] = (
+                outputs['forces'] * (~noise_mask_tensor)
+                + denoising_pos_vec * noise_mask_tensor
+            )
 
         return outputs
 
