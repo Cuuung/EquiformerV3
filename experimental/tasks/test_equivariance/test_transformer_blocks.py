@@ -5,7 +5,7 @@ from torch_cluster import radius_graph
 from models.equiformer_v3.radial_function import GaussianSmearing
 from models.equiformer_v3.so3 import SO3Grid, SO3Rotation
 from models.equiformer_v3.transformer_block import TransBlockV3
-from models.equiformer_v3.edge_rot_mat import init_edge_rot_mat
+from models.equiformer_v3.edge_rot_mat import init_edge_rot_euler_angles
 
 
 _num_nodes  = 127
@@ -98,8 +98,8 @@ def test_transformer_blocks():
 
     inputs_rot = torch.einsum('ji, nic -> njc', wigner, inputs)
 
-    edge_rot_mat = init_edge_rot_mat(edge_distance_vec)
-    so3_rotation.set_wigner(edge_rot_mat)
+    eulers = init_edge_rot_euler_angles(edge_distance_vec)
+    so3_rotation.set_wigner_from_eulers(eulers)
     outputs = block.forward(
         x=inputs,
         source_atomic_numbers=source_atomic_numbers,
@@ -111,8 +111,8 @@ def test_transformer_blocks():
     )
 
     edge_distance_vec_rot = torch.einsum('ji, ni -> nj', rot, edge_distance_vec)
-    edge_rot_mat_rot = init_edge_rot_mat(edge_distance_vec_rot)
-    so3_rotation.set_wigner(edge_rot_mat_rot)
+    eulers_rot = init_edge_rot_euler_angles(edge_distance_vec_rot)
+    so3_rotation.set_wigner_from_eulers(eulers_rot)
     outputs_rot = block.forward(
         x=inputs_rot,
         source_atomic_numbers=source_atomic_numbers,

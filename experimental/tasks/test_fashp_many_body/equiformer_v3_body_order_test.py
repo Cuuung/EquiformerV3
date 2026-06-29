@@ -15,7 +15,7 @@ from e3nn import o3
 
 from fairchem.core.models.base import GraphModelMixin
 
-from models.equiformer_v3.edge_rot_mat import init_edge_rot_mat
+from models.equiformer_v3.edge_rot_mat import init_edge_rot_euler_angles
 from models.equiformer_v3.envelope import PolynomialEnvelope
 from models.equiformer_v3.so3 import (
     SO3Rotation,
@@ -716,11 +716,9 @@ class EquiformerV3BodyOrderTest(torch.nn.Module, GraphModelMixin):
         edge_distance, 
         edge_distance_vec
     ):
-        # Compute 3x3 rotation matrix per edge
-        edge_rot_mat = self._init_edge_rot_mat(edge_distance_vec)
-
-        # Compute Wigner-D matrices
-        self.so3_rotation.set_wigner(edge_rot_mat)
+        # Compute Euler angles per edge and set Wigner-D matrices
+        eulers = self._init_edge_rot_mat(edge_distance_vec)
+        self.so3_rotation.set_wigner_from_eulers(eulers)
 
         # Envelope function
         edge_envelope_weight = self.envelope_func(edge_distance) if self.envelope_func is not None else None
@@ -832,9 +830,9 @@ class EquiformerV3BodyOrderTest(torch.nn.Module, GraphModelMixin):
         return outputs
 
 
-    # Initialize the edge rotation matrics
+    # Compute Euler angles for edge rotation frames
     def _init_edge_rot_mat(self, edge_distance_vec):
-        return init_edge_rot_mat(edge_distance_vec, use_rotation_mask=True)
+        return init_edge_rot_euler_angles(edge_distance_vec)
 
 
     @property
