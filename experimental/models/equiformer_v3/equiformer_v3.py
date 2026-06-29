@@ -420,7 +420,7 @@ class EquiformerV3_OC(torch.nn.Module, GraphModelMixin):
         edge_index, 
         edge_envelope_weight
     ):
-        num_atoms = len(atomic_numbers)
+        num_atoms = atomic_numbers.shape[0]
                 
         # Initialize node embedding
         x = torch.zeros(
