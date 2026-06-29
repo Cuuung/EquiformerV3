@@ -1,0 +1,134 @@
+# EquiformerV3 torch.compile example config
+#
+# Demonstrates the two compile modes available:
+# 1. Direct-force: enable_compile=True, compile_dynamic=False
+#    - Uses plain_compile on core_compute
+#    - Fast compilation, but traces per unique natoms/nedges shape (cache_size > 1)
+#    - Good for homogeneous datasets with stable batch sizes
+#
+# 2. Conservative-force: enable_compile=True, compile_dynamic=True
+#    - Uses make_fx + inductor double-backward (CompiledForceRegion)
+#    - Single kernel across all shapes (cache_size == 1)
+#    - Requires torch >= 2.11, ~30s first-compile overhead
+#    - Best for heterogeneous datasets with varying system sizes
+
+trainer: ocp
+
+dataset:
+  train:
+    format: lmdb
+    src: data/s2ef/all/train/
+    key_mapping:
+      y: energy
+      force: forces
+      stress: stress
+  val:
+    src: data/s2ef/all/val_id/
+
+task:
+  strict_load: True
+  eval_relaxations: False
+
+logger: wandb
+
+loss_functions:
+  - energy:
+      fn: mae
+      coefficient: 1
+  - forces:
+      fn: l2mae
+      coefficient: 100
+  - stress:
+      fn: mae
+      coefficient: 10
+
+evaluation_metrics:
+  metrics:
+    energy:
+      - mae
+    forces:
+      - mae
+      - cosine_similarity
+    stress:
+      - mae
+  primary_metric: forces_mae
+
+outputs:
+  energy:
+    level: system
+    prediction_dtype: float32
+  forces:
+    level: atom
+    train_on_free_atoms: True
+    eval_on_free_atoms: True
+  stress:
+    level: system
+
+model:
+  name: equiformer_v3
+  # Core model settings
+  use_pbc: False
+  otf_graph: True
+  regress_forces: True
+  regress_stress: True
+  direct_prediction: False          # Set False for conservative-force (compile_dynamic=True)
+  lmax: 2
+  mmax: 2
+  num_layers: 4
+  num_channels: 128
+  num_radial_basis: 32
+  max_radius: 5.0
+  max_neighbors: 20
+  attn_hidden_channels: 64
+  attn_alpha_channels: 64
+  attn_value_channels: 64
+  ffn_hidden_channels: 64
+  edge_channels: 64
+  attn_grid_resolution_list: [8, 4]
+  ffn_grid_resolution_list: [8, 8]
+  attn_weights_drop: 0.0
+  drop_path_rate: 0.0
+  alpha_drop: 0.1
+  value_drop: 0.0
+  proj_drop: 0.1
+  ffn_drop: 0.1
+  attn_mask_rate: 0.0
+
+  # torch.compile settings
+  enable_compile: True              # Enable in-model compilation
+  compile_dynamic: True             # True: single-kernel across shapes (torch>=2.11)
+                                    # False: bucketed by shape (faster compile)
+
+  # DeNS-specific (optional, set denoising=True to use DeNS model)
+  denoising: False
+  # denoise_value:
+  # denoise_atom_types:
+  # noise_type: std
+  # noise_std: 0.1
+  # noise_min: 0.05
+  # noise_max: 0.5
+
+optim:
+  batch_size: 8
+  eval_batch_size: 8
+  load_balancing: atoms
+  num_workers: 2
+  eval_every: 5000
+  optimizer: AdamW
+  lr_initial: 1.e-4
+  optimizer_params:
+    amsgrad: True
+    weight_decay: 0
+  scheduler: ReduceLROnPlateau
+  mode: min
+  factor: 0.8
+  patience: 3
+  max_epochs: 100
+  ema_decay: 0.999
+  clip_grad_norm: 10
+
+  # Note: optim.use_compile is mutually exclusive with model.enable_compile
+  # use_compile: False              # Outer torch.compile (mutually exclusive with enable_compile)
+
+slurm:
+  constraint: "rtx_6000"

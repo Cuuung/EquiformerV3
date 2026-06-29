@@ -155,17 +155,78 @@ bash scripts/compile_env.sh compile_dev/test_mutual_exclusion.py
 
 ---
 
+### 7. `test_stage_dynamic_base.py`
+
+**Purpose:** Dynamic=True gate (base / non-DeNS) — verify the distinguishing
+property of `compile_dynamic=True` over bucketing: 3 distinct system sizes
+(different natoms AND nedges) share ONE compiled kernel. The CompiledForceRegion
+cache stays at size 1 throughout.
+
+Also checks force/stress are finite and numerically consistent with eager
+(tolerance <1e-5), and shapes 2+ run in <2s (zero recompile; first compile ~27s).
+
+**Pass criteria:**
+- `cache_size == 1` for all 3 shapes (single_kernel=True)
+- `max_diff(forces) < 1e-5`, `max_diff(stress) < 1e-5`
+- All outputs finite
+- Shapes 2+ complete in <2s (no recompile)
+
+**Rerun command:**
+```bash
+bash scripts/compile_env.sh compile_dev/test_stage_dynamic_base.py
+```
+
+**Requirement:** `torch >= 2.11` for dynamic symbolic `make_fx`. Skips with code 0
+on older torch.
+
+---
+
+### 8. `test_stage_dynamic_dens.py`
+
+**Purpose:** Same as `test_stage_dynamic_base.py` but for `EquiformerV3DeNS_OC`
+with denoising-active batch. Verifies single-kernel dynamic=True behavior holds
+with DeNS force-embedding path and eager `dens_block`.
+
+**Pass criteria:** Same as gate 7, applied to DeNS model with denoising batch.
+
+**Rerun command:**
+```bash
+bash scripts/compile_env.sh compile_dev/test_stage_dynamic_dens.py
+```
+
+**Requirement:** `torch >= 2.11` — same as gate 7.
+
+---
+
+### 9. `test_single_frame.py`
+
+**Purpose:** Finding-A gate — verify that backbone and heads use the SAME random
+SO(2) frame (single-frame semantics). After core_compute refactor returns edge
+features, both paths share identical edge_distance_exp and edge_envelope_weight.
+
+**Pass criteria:**
+- Edge features from core_compute match those used by heads (bit-exact equality)
+- No redundant `_forward_edge` calls causing frame desync
+
+**Rerun command:**
+```bash
+bash scripts/compile_env.sh compile_dev/test_single_frame.py
+```
+
+---
+
 ## Full Regression Run
 
 ```bash
 for s in verify_rotation_migration verify_core_compute_refactor test_stage_direct \
-          test_stage_conservative_dens test_stage_conservative_base test_mutual_exclusion; do
+          test_stage_conservative_base test_stage_conservative_dens test_mutual_exclusion \
+          test_stage_dynamic_base test_stage_dynamic_dens test_single_frame; do
   echo "=== $s ==="
   bash scripts/compile_env.sh compile_dev/$s.py || echo "FAIL $s"
 done
 ```
 
-Expected: all 6 gates PASS.
+Expected: all 9 gates PASS.
 
 ---
 
