@@ -523,7 +523,7 @@ class EquiformerV3_OC(torch.nn.Module, GraphModelMixin):
             edge_envelope_weight,
             batch,
         )
-        return x_scalar, x
+        return x_scalar, x, edge_distance, edge_envelope_weight
 
 
     def _forward_direct(self, data):
@@ -554,16 +554,13 @@ class EquiformerV3_OC(torch.nn.Module, GraphModelMixin):
                 from fairchem.core.common.compile_utils import plain_compile
                 self._compiled_core = plain_compile(self.core_compute, dynamic=self.compile_dynamic)
             compute = self._compiled_core
-        x_scalar, x = compute(
+        x_scalar, x, edge_distance, edge_envelope_weight = compute(
             atomic_numbers,
             edge_distance,
             edge_distance_vec,
             edge_index,
             data.batch,
         )
-        # Re-expand edge features for the eager prediction heads (core_compute
-        # consumed the raw distance internally and returns only embeddings).
-        edge_distance, edge_envelope_weight = self._forward_edge(edge_distance, edge_distance_vec)
 
         outputs = {}
 
@@ -658,7 +655,7 @@ class EquiformerV3_OC(torch.nn.Module, GraphModelMixin):
 
         atomic_numbers = data.atomic_numbers.long()
 
-        x_scalar, x = self.core_compute(
+        x_scalar, x, _, _ = self.core_compute(
             atomic_numbers,
             edge_distance,
             edge_distance_vec,
@@ -762,7 +759,7 @@ class EquiformerV3_OC(torch.nn.Module, GraphModelMixin):
             shifts = torch.einsum("ej,ejk->ek", co, cell_e)
             edv = pos_p.index_select(0, src) - pos_p.index_select(0, dst) + shifts
             ed = torch.linalg.norm(edv, dim=-1)
-            x_scalar, _x = self.core_compute(an, ed, edv, ei, batch)
+            x_scalar, _x, _, _ = self.core_compute(an, ed, edv, ei, batch)
             node_e = energy_block(x_scalar).view(-1)
             energy = torch.zeros(n_sys, device=node_e.device, dtype=node_e.dtype)
             energy.index_add_(0, batch, node_e)
