@@ -159,6 +159,7 @@ class EquiformerV3DeNS_OC(EquiformerV3_OC):
 
         enable_compile: bool = False,
         compile_dynamic: bool = False,
+        use_amp: bool = False,
     ):
         super().__init__(
             use_pbc,
@@ -221,6 +222,7 @@ class EquiformerV3DeNS_OC(EquiformerV3_OC):
 
             enable_compile,
             compile_dynamic,
+            use_amp,
         )
 
         # Force encoding

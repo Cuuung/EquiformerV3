@@ -152,6 +152,13 @@ class BaseTrainer(ABC):
             "slurm": slurm,
             "gp_gpus": gp_gpus,
         }
+        # fp32 matmul precision: "highest" (pure fp32, default) | "high" (TF32) | "medium".
+        # Global flag, applies to both eager and torch.compile; affects fp32 matmuls only.
+        matmul_precision = optimizer.get("matmul_precision", "highest")
+        if matmul_precision != "highest":
+            torch.set_float32_matmul_precision(matmul_precision)
+            logging.info(f"Set float32 matmul precision to '{matmul_precision}'")
+
         # AMP Scaler
         self.scaler = torch.GradScaler("cuda") if amp and not self.cpu else None
 

@@ -182,6 +182,9 @@ class EquiformerV3_OC(torch.nn.Module, GraphModelMixin):
 
         enable_compile: bool = False,
         compile_dynamic: bool = False,
+        # bf16 混合精度（DPA4 式，roadmap §7）：只对交互块做 bf16 autocast，几何/归一化
+        # 保持 fp32。与 trainer 级 optim.amp(fp16+GradScaler) 互斥，勿同时开。
+        use_amp: bool = False,
     ):
         super().__init__()
 
@@ -391,6 +394,7 @@ class EquiformerV3_OC(torch.nn.Module, GraphModelMixin):
         self.compile_dynamic = compile_dynamic
         self._compiled_core = None
         self._compiled_region = None
+        self.use_amp = use_amp
 
 
     def _forward_edge(
@@ -459,33 +463,41 @@ class EquiformerV3_OC(torch.nn.Module, GraphModelMixin):
         edge_envelope_weight,
         batch
     ):
-        # Transformer blocks
-        for i in range(self.num_layers):
-            if self.gradient_checkpointing_block_list[i] == 0:
-                x = self.blocks[i](
-                    x, 
-                    source_atomic_numbers, 
-                    target_atomic_numbers, 
-                    edge_distance, 
-                    edge_index,
-                    edge_envelope_weight,
-                    batch,     # for GraphDropPath
-                )
-            elif self.gradient_checkpointing_block_list[i] == 1:
-                x = torch.utils.checkpoint.checkpoint(
-                    self.blocks[i],
-                    x,                  
-                    source_atomic_numbers,
-                    target_atomic_numbers,
-                    edge_distance,
-                    edge_index,
-                    edge_envelope_weight,
-                    batch,     # for GraphDropPath
-                    use_reentrant=False
-                )
-            else:
-                raise ValueError
-            
+        # bf16 混合精度（DPA4 式，roadmap §7）：autocast 只包交互块；几何/边特征已在
+        # fp32 算好，留在区外。仅训练+CUDA+开关时生效。末层 norm 自带
+        # @torch.cuda.amp.autocast(enabled=False) fp32 守卫，故放区外即可。
+        _amp = self.use_amp and self.training and x.is_cuda
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=_amp):
+            # Transformer blocks
+            for i in range(self.num_layers):
+                if self.gradient_checkpointing_block_list[i] == 0:
+                    x = self.blocks[i](
+                        x,
+                        source_atomic_numbers,
+                        target_atomic_numbers,
+                        edge_distance,
+                        edge_index,
+                        edge_envelope_weight,
+                        batch,     # for GraphDropPath
+                    )
+                elif self.gradient_checkpointing_block_list[i] == 1:
+                    x = torch.utils.checkpoint.checkpoint(
+                        self.blocks[i],
+                        x,
+                        source_atomic_numbers,
+                        target_atomic_numbers,
+                        edge_distance,
+                        edge_index,
+                        edge_envelope_weight,
+                        batch,     # for GraphDropPath
+                        use_reentrant=False
+                    )
+                else:
+                    raise ValueError
+
+        # bf16 下块输出是 bf16，转回 fp32 让 norm 及下游能量/力都在 fp32
+        if _amp:
+            x = x.float()
         # Final layer norm
         x = self.norm(x)
         x_scalar = x.narrow(1, 0, 1)

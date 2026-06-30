@@ -402,6 +402,16 @@ class EquiformerV3DeNSTrainer(EquiformerV2ForcesTrainer):
     def train(self, disable_eval_tqdm=False):
         ensure_fitted(self._unwrapped_model, warn=True)
 
+        # 护栏：trainer 级 optim.amp(整图 fp16+GradScaler) 与 model.use_amp
+        # (块级 bf16，DPA4 式) 互斥，同时开会嵌套冲突且 GradScaler 对 bf16 无意义。
+        if self.config["optim"].get("amp", False) and self.config.get(
+            "model", {}
+        ).get("use_amp", False):
+            raise ValueError(
+                "optim.amp (fp16+GradScaler) 与 model.use_amp (bf16) 不能同时开启，"
+                "请二选一：bf16 用 model.use_amp，fp16 用 optim.amp。"
+            )
+
         eval_every = self.config["optim"].get(
             "eval_every", len(self.train_loader)
         )
