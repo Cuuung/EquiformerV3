@@ -65,6 +65,11 @@ RUN pip install --no-cache-dir torchvision==0.26.0 \
     && pip install --no-cache-dir -e "packages/fairchem-core" timm==0.4.12 \
         -i https://pypi.tuna.tsinghua.edu.cn/simple
 
+# ase-db-backends：packages/requirements.txt 列了它（git 版），但 editable 装 fairchem-core
+# 只读 pyproject 依赖、不读 requirements.txt，故单独补装（DB dataset backend 运行时需要）。
+RUN pip install --no-cache-dir ase-db-backends==0.10.0 \
+        -i https://pypi.tuna.tsinghua.edu.cn/simple
+
 # 运行时从挂载的 AFS 读取代码：src（fairchem 包）+ 仓库根（顶层 experimental 包 + my_main.py）
 ENV PYTHONPATH=/mnt/afs/home/maoruicong/LAM_understanding/repositories/equiformer_v3/src:/mnt/afs/home/maoruicong/LAM_understanding/repositories/equiformer_v3
 
