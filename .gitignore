@@ -63,3 +63,6 @@ wandb/
 *.lmdb
 *.lmdb-lock
 metadata*.npz
+
+# Claude Code scratch output (redirect target for cluster-node ENOSPC workaround)
+.claude_tmp_out.txt
