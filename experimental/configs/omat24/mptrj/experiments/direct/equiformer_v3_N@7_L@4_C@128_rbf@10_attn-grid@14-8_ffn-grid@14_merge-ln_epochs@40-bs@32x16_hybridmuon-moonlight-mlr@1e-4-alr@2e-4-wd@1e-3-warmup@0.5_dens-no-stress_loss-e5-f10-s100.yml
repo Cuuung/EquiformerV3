@@ -1,0 +1,315 @@
+dataset:
+  train:
+    format: ase_db
+    src:
+      - /mnt/afs/share/dataset/periodicSystem/MPtrj/aselmdb/train
+    a2g_args:
+      r_energy: True      # already use `uncorrected_total_energy` after pre-processing
+      r_forces: True
+      r_stress: True
+    transforms:
+      #decompose_tensor:
+      #  tensor: stress
+      #  rank: 2
+      #  decomposition:
+      #    stress_isotropic:
+      #      irrep_dim: 0
+      #    stress_anisotropic:
+      #      irrep_dim: 2
+
+      normalizer:
+        #######################################################################################
+        #   Use either `fit`, `file` or specifying everything
+        #   1.  If loading from a checkpoint, the values from using `fit` will be overwritten
+        #######################################################################################
+        #fit:
+        #  targets:
+        #    energy: { mean: 0.0}
+        #    forces: { mean: 0.0 }
+        #    stress: { mean: 0.0 }
+        #    #stress_isotropic: { }
+        #    #stress_anisotropic: { mean: 0.0 }
+        #  batch_size: 64
+        #  num_batches: 10000
+        #file: experimental/configs/omat24/mptrj/preprocessing/equiformer_v2_mptrj_normalizer.pt
+        energy:
+          mean:     0.0
+          rmsd:     0.8124567446457275    # (1) Following eSEN
+                                          # (2) Remove the division after sum aggregation for energy prediction
+        forces:
+          mean:     0.0
+          rmsd:     0.8124567446457275
+        stress:
+          mean:     0.0
+          rmsd:     0.8124567446457275
+        #isotropic_stress:
+        #  mean:     -0.003037823364138603
+        #  stdev:    0.06647835671901703
+        #anisotropic_stress:
+        #  mean:     0.0
+        #  stdev:    0.026824669912457466
+
+      element_references:
+        #######################################################################################
+        #   Use either `fit` or `file`
+        #   1.  If loading from a checkpoint, the values from using `fit` will be overwritten
+        #######################################################################################
+        #fit:
+        #  targets:
+        #    - energy
+        #  batch_size: 64
+        #  num_batches: 1000
+        #file: experimental/configs/omat24/mptrj/preprocessing/equiformer_v2_mptrj_element_references.pt
+        energy:
+          file: experimental/configs/omat24/mptrj/preprocessing/equiformer_v2_mptrj_energy_element_references.npz
+
+  val:
+    format: ase_db
+    src:
+      - /mnt/afs/share/dataset/periodicSystem/MPtrj/aselmdb/val
+    a2g_args:
+      r_energy: True      # already use `uncorrected_total_energy` after pre-processing
+      r_forces: True
+      r_stress: True
+
+
+trainer:              equiformer_v3_dens_trainer
+
+
+logger:
+  name:               wandb
+  project:            equiformer_v3_mptrj
+
+
+hide_eval_progressbar: False
+
+
+evaluation_metrics:
+  primary_metric: forces_mae
+  metrics:
+    energy:
+      - mae
+      - per_atom_mae
+    forces:
+      - mae
+      - cosine_similarity
+    stress:
+      - mae
+
+
+outputs:
+  energy:
+    level:                system
+    property:             energy
+  forces:
+    level:                atom
+    property:             forces
+    train_on_free_atoms:  True
+    eval_on_free_atoms:   True
+  stress:
+    level:                system
+    property:             stress
+
+
+loss_functions:
+  - energy:
+      fn:                 per_atom_mae
+      coefficient:        5      # CHANGED: E:F:S = 5:10:100 (was 20:20:5)
+  - forces:
+      fn:                 l2mae
+      coefficient:        10
+  - stress:
+      fn:                 mae
+      coefficient:        100
+
+
+model:
+  name:                         equiformer_v3_dens
+
+  use_pbc:                      True
+  use_pbc_single:               True      # Process batch PBC graphs one at a time.
+                                          # This argument is set to True when training on MPtrj.
+  otf_graph:                    True
+
+  regress_forces:               True
+  regress_stress:               True
+  direct_prediction:            True
+
+  max_neighbors:                300
+  max_radius:                   6.0
+  num_radial_basis:             10
+  max_num_elements:             128
+
+  num_layers:                   7       # CHANGED 2 -> 7 : paper ~30M MPtrj model (Table 10)
+  num_channels:                 128     # CHANGED 64 -> 128 : paper d_embed (4, 128)
+  attn_hidden_channels:         32
+  num_heads:                    8
+  attn_alpha_channels:          64
+  attn_value_channels:          16
+  ffn_hidden_channels:          512
+  norm_type:                    'merge_layer_norm'  # ['sep_layer_norm', 'sep_layer_norm_liger']
+
+  lmax:                         4       # CHANGED 2 -> 4 : paper Lmax=4
+  mmax:                         2
+  attn_grid_resolution_list:    [14,  8]
+  ffn_grid_resolution_list:     [14, 14]
+
+  edge_channels:                128
+  use_atom_edge_embedding:      True
+  use_envelope:                 True
+
+  attn_activation:              'sep-merge_gates2_swiglu'
+  use_attn_renorm:              True
+  use_add_merge:                False
+  use_rad_l_parametrization:    True
+  softcap:                      null
+  ffn_activation:               'sep-merge_gates2_swiglu'
+  use_grid_mlp:                 True
+
+  use_gate_force_head:          True
+
+  alpha_drop:                   0.0
+  attn_mask_rate:               0.0
+  attn_weights_drop:            0.1
+  value_drop:                   0.0
+  drop_path_rate:               0.05
+  proj_drop:                    0.0
+  ffn_drop:                     0.0
+
+  gradient_checkpointing_block_list:    [0, 0, 0, 0, 0, 0, 0]   # length == num_layers (7). OFF for direct (fp16, single
+                                                                # backward; paper ran 32/GPU on H100-80GB). If OOM on A100-80GB
+                                                                # with DeNS, flip to [1,1,1,1,1,1,1] to trade compute for memory.
+
+  enforce_max_neighbors_strictly:       True
+
+  avg_num_nodes:                1       # Remove the division after sum aggregation over nodes for energy prediction
+
+
+optim:
+  batch_size:                   32      # per-GPU; run on 16 GPU -> global 512. SAME global batch as the proven ratio mlr@1e-3 run (32x16)
+                                        # AND as the validated moonlight-4e-4 calibration run (8x64) -> muon_lr stays in its validated regime.
+                                        # NOTE: launch this config on 16 GPU (set device count = 16 in the job). 32 x 16 = global 512.
+  grad_accumulation_steps:      1
+  eval_batch_size:              32
+  load_balancing:               atoms
+  num_workers:                  0       # lmdb env not fork-safe -> num_workers>0 segfaults
+  lr_initial:                   0.0002  # AdamW lr for the NON-matrix params (biases, norms, embeddings)
+
+  #####################################################################################
+  #  ===== MOONLIGHT direct-force pretrain, PAPER ~30M model, 40ep, 16 GPU (32x16=512) =
+  #  Stage-1 of the moonlight two-stage pipeline (stage-2 = separate gradient-force finetune).
+  #  MODEL = paper's ~30M MPtrj model (Table 10): Lmax=4, 7 layers, C=128 (see model block).
+  #  vs the original paper recipe, ONLY two axes differ: (A) optimizer AdamW -> HybridMuon
+  #  (moonlight), and (B) epochs: direct 70 -> 40. Everything else follows the established
+  #  recipe (loss e5-f10-s100, warmup 0.5, dropout 0.1 / drop-path 0.05, DeNS, global batch 512).
+  #
+  #  ===== THIS RUN = P0-b/P0-c BOUNDARY EXPERIMENT: muon_lr 1.5e-4 -> 1e-4 + epochs 25 -> 40 =====
+  #  Derived from the FIRST healthy 30M run (mlr@1.5e-4, 25ep -> val cos 0.7516). Rationale:
+  #    - P0-b: do NOT raise muon_lr. History says higher lr = shorter survival (4e-4->ep9.6,
+  #      2e-4->ep21). To ADD epochs safely we LOWER lr instead (1.5e-4 -> 1e-4), buying survival room.
+  #    - P0-c: more epochs for a more-converged fit. The 2e-4 best_ckpt hit 0.756 @ep20 (> the
+  #      1.5e-4/25ep 0.7516), so the model has headroom above 0.7516 -> longer training should help.
+  #  CAVEAT -- this is a BOUNDARY probe, not a comfortably-safe recipe. Survival extrapolation
+  #  (halving lr ~doubles survival): 1e-4 -> ~ep40-42, i.e. the 40ep horizon sits RIGHT AT the edge
+  #  (~0-2ep margin). Stretching the cosine to 40ep also keeps the mid-training eff lr hotter than the
+  #  25ep schedule (ep20 eff ~5e-5 vs the 25ep run's ~1.45e-5), which can pull survival BELOW 40.
+  #  So a late-run (ep35-40) runaway is plausible. The ABSOLUTE backstop + best_checkpoint are the
+  #  safety net: even if it runs away near ep38, best_checkpoint captures the pre-collapse peak.
+  #  WATCH ep28-40 (the near-convergence danger band shifts later at this slower schedule): rising
+  #  max NS-input RMS / falling val cosine = runaway starting. Safer fallbacks if it collapses:
+  #  35ep (same 1e-4), or 0.8e-4 + 40ep (survival extrap ~ep50 -> real margin).
+  #
+  #  HISTORY (deep-model failures behind the current recipe):
+  #   (1) 40ep/mlr@4e-4: silent stall from a guard BUG (EMA frozen on skip); FIXED in muon.py.
+  #   (2) 35ep/mlr@4e-4 (06-19): guard fix worked, but DIVERGED at ep9.6 -- 4e-4 too hot for THIS
+  #       deep model (moonlight's shape-scaling does NOT account for DEPTH: 7 blocks + Lmax=4 compound).
+  #   (3) 35ep/mlr@2e-4 (06-20): HEALTHY to ep20 (val cos 0.756, still rising) then a SLOW self-
+  #       amplifying runaway from ep21 (max NS-input RMS 0.12->9.4 over ~0.5ep), never NaN -> no crash
+  #       -> ran to ep35 LOBOTOMIZED (val flat 9.96 for 11ep). Muon's update is gradient-magnitude-
+  #       INDEPENDENT, so near a converged sharp minimum it keeps taking constant-size steps and wanders
+  #       out; the EMA-relative spike guard SELF-DISARMS in a slow runaway. FIX = absolute backstop
+  #       (spike_abs_threshold) + lower lr + steep tail decay.
+  #   (4) 25ep/mlr@1.5e-4 (06-22/23): FIRST healthy full 30M run -- textbook monotonic convergence,
+  #       val cos 0.7516 @ep25, danger band ep15-22 CLEAN (max NS-input RMS ~0.13-0.29, backstop never
+  #       fired). THIS run extends that: same guards/schedule shape, lr 1.5e-4->1e-4, epochs 25->40.
+  #
+  #  HybridMuon: Muon (Newton-Schulz orthogonalized momentum) for the weight matrices
+  #  (nn.Linear 2D + SO3Linear 3D), AdamW for biases / norms / embeddings.
+  #  - lr_initial (above) is the AdamW lr applied to the non-matrix params (UNCHANGED at 2e-4).
+  #  - The cosine LambdaLR scales BOTH group lrs by the same multiplier.
+  #  - Under plain DDP this is correct (grads all-reduced before step -> identical Muon updates on
+  #    every rank). Muon's update is norm-normalized -> per-step magnitude is batch-INDEPENDENT:
+  #    this muon_lr stays valid across card counts as long as global=512.
+  #####################################################################################
+  optimizer:                    HybridMuon
+  optimizer_params:
+    weight_decay:               0.001
+    update_scale:               moonlight # shape-decoupled update scaling 0.2*sqrt(max(rows,cols)) (update RMS ~0.17*lr
+                                          # for every matrix). Makes muon_lr ~transferable across WIDTH (not depth).
+    muon_lr:                    0.0001    # 1e-4 (= 0.5x the AdamW lr 2e-4). CHANGED 1.5e-4 -> 1e-4 for the 40ep horizon.
+                                          # History: 4e-4 -> diverged ep9.6; 2e-4 -> diverged ep21; 1.5e-4 -> clean 25ep (0.7516).
+                                          # Survival extrap (halving lr ~doubles survival): 1e-4 -> ~ep40-42. This is the LOWER-lr
+                                          # half of the P0-b/P0-c package: do not raise lr (shortens survival), lower it to afford
+                                          # more epochs. NOTE: at 40ep this is a BOUNDARY probe (~0-2ep margin) -- see header. Safer
+                                          # fallbacks if it runs away: max_epochs 40->35 (same 1e-4), or muon_lr 1e-4->0.8e-4.
+    momentum:                   0.95      # Muon momentum
+    nesterov:                   True      # Muon nesterov look-ahead
+    ns_steps:                   5         # Newton-Schulz iterations
+    betas:                      [0.9, 0.95]   # AdamW path
+    eps:                        1.0e-8
+    # --- Muon-side divergence guard [skip-step protection] ----------------------------
+    #  clip_grad_norm is INERT for the Muon group (Newton-Schulz norm-normalizes the
+    #  update, so a global grad-clip cancels out); the only effective Muon protection acts
+    #  on the update itself. DDP-safe (synced grads -> identical skip on every rank).
+    skip_nonfinite:             True   # NaN/Inf grad -> skip the matrix WITHOUT updating its
+                                       #   momentum buffer (breaks the fp16 NaN death-spiral)
+    spike_factor:               8.0    # skip a matrix when its Newton-Schulz-input RMS jumps
+                                       #   >8x its own EMA (self-calibrating; set null to disable)
+    spike_ema_decay:            0.99   # EMA decay for the per-matrix RMS baseline
+    spike_warmup_steps:         200    # no spike-skips until the EMA has stabilized
+    spike_max_consecutive_skips: 25    # DEADLOCK BACKSTOP (fixes the 40ep stall): after 25 consecutive
+                                       #   spike-skips on one matrix, force-commit + re-baseline its EMA so it
+                                       #   can never freeze forever. Pairs with the EMA-advance-on-skip fix in muon.py.
+    spike_abs_threshold:        4.0    # ABSOLUTE RUNAWAY BACKSTOP (the real fix for the 06-20 ep21 silent
+                                       #   collapse). The 8x-EMA guard above is RELATIVE and SELF-DISARMS in a slow
+                                       #   runaway (its EMA drifts up with the gradient). This one does NOT drift:
+                                       #   if the per-step MAX NS-input RMS stays >4.0 for spike_abs_max_consecutive
+                                       #   steps, ABORT (raise). Healthy training kept it <=~2.4, so 4.0 sustained is
+                                       #   unambiguously a runaway. best_checkpoint = pre-runaway peak. null disables.
+                                       #   *** At 40ep this is the primary insurance for a late (ep35-40) boundary runaway. ***
+    spike_abs_max_consecutive:  10     # consecutive over-threshold steps before abort (a 1-step transient won't trip)
+    log_every:                  200    # master-rank periodic "max NS-input RMS" log (skips always logged)
+  scheduler:                    LambdaLR
+  scheduler_params:
+    lambda_type:                cosine
+    warmup_factor:              0.001   # start at a tiny non-zero lr instead of exactly 0.
+    warmup_epochs:              0.5     # longer warmup to ease HybridMuon into full lr.
+    lr_min_factor:              0.001   # STEEPER tail (0.01 -> 0.001): drives the eff lr to ~tiny by the end so the
+                                        # post-convergence steps shrink before Muon's constant-size update can wander
+                                        # out of the converged basin. NOTE: over the 40ep horizon the tail decays more
+                                        # gradually than at 25ep -> if a late runaway appears, steepening this further
+                                        # (or shortening to 35ep) is the first lever.
+
+  max_epochs:                   40    # CHANGED 25 -> 40 (P0-c): more epochs for a more-converged fit (2e-4 hit 0.756 @ep20,
+                                      # so there is headroom above the 25ep run's 0.7516). Paired with muon_lr 1.5e-4->1e-4 so the
+                                      # longer horizon runs at a proportionally smaller step. BOUNDARY: survival extrap ~ep40-42,
+                                      # so 40 sits at the edge -- watch ep28-40, rely on the absolute backstop + best_checkpoint.
+  clip_grad_norm:               100
+  ema_decay:                    0.999
+
+  eval_every:                   5000
+
+  use_denoising_pos:            True
+  denoising_pos_params:
+    prob:                       0.5
+    fixed_noise_std:            True
+    std:                        0.025
+    corrupt_ratio:              0.5
+    num_steps:                  50    # not used
+    std_low:                    0.01  # not used
+    std_high:                   0.5   # not used
+    min_num_atoms:              null
+    strict_max_ratio:           0.75
+  denoising_pos_coefficient:    10
+
+  use_compile:                  True
