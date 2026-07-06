@@ -196,6 +196,12 @@ model:
   enforce_max_neighbors_strictly:       True
 
   avg_num_nodes:                1       # Remove the division after sum aggregation over nodes for energy prediction
+  enable_compile:               False    # in-model make_fx 区域编译（新 compile；与 optim.use_compile 互斥，故下方 use_compile 关）。
+                                        # 本分支目的：让保守力 double-backward 在 dynamic=True symbolic 路径下跑通（需 torch>=2.11）。
+  compile_dynamic:              True    # plain_compile(dynamic=True)：动态 shape 编译（否则每种 shape 重编译）
+  use_amp:                      False    # 块级 bf16 autocast（DPA4 式，无 GradScaler）：只包交互块，Wigner-D/几何留 fp32、
+                                        # 块输出再转回 fp32，故不触发 fp16 那条 so3.rotate bmm(half,float) 失配。与 optim.amp/fp16
+                                        # 互斥（trainer 有护栏），故本档启动脚本 **不要** 加 --amp。保守力双反向 + bf16 尚未实测，属验证项。
 
 
 optim:
@@ -285,8 +291,12 @@ optim:
     spike_ema_decay:            0.99   # EMA decay for the per-matrix RMS baseline
     spike_warmup_steps:         200    # no spike-skips until the EMA has stabilized
     spike_max_consecutive_skips: 25    # deadlock backstop (fixes the 40ep stall): force-commit + re-baseline a matrix after 25 consecutive skips
-    spike_abs_threshold:        4.0    # ABSOLUTE runaway backstop (new): abort if per-step MAX NS-input RMS stays >4.0 for
+    spike_abs_threshold:        15.0   # ABSOLUTE runaway backstop: abort if per-step MAX NS-input RMS stays >15.0 for
                                        #   spike_abs_max_consecutive steps -- catches the slow runaway the 8x-EMA guard self-disarms on. null disables.
+                                       #   RAISED 4.0 -> 15.0 (07-03): grad-ft continuation is a genuine re-optimization (conservative-force objective
+                                       #   change), so NS-input RMS (= raw momentum RMS; moonlight normalizes only the OUTPUT, so muon_lr does NOT lower it)
+                                       #   sits naturally flat at ~6-7.4 here (measured step200-209, no skips) -> 4.0 false-aborted @step209. 15.0 clears the
+                                       #   baseline with margin while still capping a true unbounded runaway.
     spike_abs_max_consecutive:  10     # consecutive over-threshold steps before abort
     log_every:                  200    # master-rank periodic "max NS-input RMS" log (skips always logged)
   scheduler:                    LambdaLR
@@ -316,7 +326,7 @@ optim:
   denoising_pos_coefficient:    10
 
   use_compile:                  False   # CHANGED: torch.compile is unstable with the double backward of gradient forces
-
+  matmul_precision:             highest
   #####################################################################################
   #  Stage-1 direct-force checkpoint to finetune from.
   #  NOTE: when launched via the two-stage pipeline script this path is OVERRIDDEN on the

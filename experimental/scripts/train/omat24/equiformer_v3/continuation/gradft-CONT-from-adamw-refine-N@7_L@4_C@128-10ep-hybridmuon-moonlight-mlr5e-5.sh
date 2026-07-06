@@ -31,20 +31,21 @@
 ###############################################################################
 set -euo pipefail
 
-cd /mnt/afs/home/yaolekai/MLIP/equiformer_v3
+REPO=/mnt/afs/home/maoruicong/LAM_understanding/repositories/equiformer_v3
+cd "$REPO"
 
 # --- wandb egress fix: strip any dev-machine proxy leaked from the submit shell --
 unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY
 
 # DO NOT pip install: the docker image bakes in an OLD fairchem (no HybridMuon).
 # PYTHONPATH is searched before site-packages -> point it at this repo's src.
-export PYTHONPATH=/mnt/afs/home/yaolekai/MLIP/equiformer_v3/src:${PYTHONPATH:-}
+export PYTHONPATH="$REPO/src:${PYTHONPATH:-}"
 # Reduce CUDA fragmentation (helps the memory-heavy fp32 conservative-force grad-ft stage).
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 python -c "import inspect, fairchem.core.trainers.base_trainer as bt; assert 'HybridMuon' in inspect.getsource(bt), 'WRONG fairchem imported (no HybridMuon branch): '+bt.__file__; print('[gradft-cont] fairchem OK:', bt.__file__)"
 
 ############################## EDIT THESE #####################################
-RUN_DIR='/mnt/afs/share/checkpoint/equiformerV3/yaolekai'
+RUN_DIR='/mnt/afs/share/checkpoint/equiformerV3/maoruicong'   # outputs -> your dir
 
 GRADFT_CFG='experimental/configs/omat24/mptrj/experiments/gradient/equiformer_v3_grad-finetune_N@7_L@4_C@128_rbf@10_attn-grid@14-8_ffn-grid@14_merge-ln_CONT-from-adamw-refine_epochs@10-bs@8x16x4-maxatoms150_hybridmuon-moonlight-mlr@5e-5-alr@5e-5-wd@1e-3_loss-e5-f10-s100.yml'
 GRADFT_ID='muon_N7L4C128_gradft_10ep_moonlight_mlr5e-5_maxatoms150_bs8x16x4_from-adamw-refine'
