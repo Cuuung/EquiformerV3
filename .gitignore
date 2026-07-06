@@ -66,3 +66,6 @@ metadata*.npz
 
 # Claude Code scratch output (redirect target for cluster-node ENOSPC workaround)
 .claude_tmp_out.txt
+
+# profiler traces (EQV3_PROF / ESEN_PROF output) — multi-GB, dev artifacts only
+docs/train_speed_analysis/**/*.trace.json
