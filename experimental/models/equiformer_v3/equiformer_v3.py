@@ -1,3 +1,4 @@
+import contextlib
 import math
 import torch
 
@@ -467,7 +468,15 @@ class EquiformerV3_OC(torch.nn.Module, GraphModelMixin):
         # fp32 算好，留在区外。仅训练+CUDA+开关时生效。末层 norm 自带
         # @torch.cuda.amp.autocast(enabled=False) fp32 守卫，故放区外即可。
         _amp = self.use_amp and self.training and x.is_cuda
-        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=_amp):
+        # 注意：torch.autocast(enabled=False) 会主动关闭外层 optim.amp 的 fp16
+        # autocast，导致块内 so3.rotate 的 bmm(wigner=half, inputs=float) 失配。
+        # 故 _amp=False 时不进任何 autocast，让外层 fp16 混合精度透传；只有 bf16
+        # 才真正包一层 bf16 autocast。
+        blocks_ctx = (
+            torch.autocast("cuda", dtype=torch.bfloat16)
+            if _amp else contextlib.nullcontext()
+        )
+        with blocks_ctx:
             # Transformer blocks
             for i in range(self.num_layers):
                 if self.gradient_checkpointing_block_list[i] == 0:
