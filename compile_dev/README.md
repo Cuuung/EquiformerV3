@@ -230,6 +230,30 @@ Expected: all 9 gates PASS.
 
 ---
 
+## In-training profiler (`EQV3_PROF`)
+
+Env-gated `torch.profiler` hook inside `equiformer_v3_dens_trainer.py` (mirrors
+esen's `ESEN_PROF`). Default off / no-op; master-rank only. Profiles the **real
+training loop** (real batches, DDP, optimizer, compile+precision path) — use it
+to see which CUDA kernels dominate a step (e.g. whether the `reduce_edge` scatter
+fuses under bf16, roadmap §8.3-A).
+
+```bash
+export EQV3_PROF=1          # main switch (ESEN_PROF=1 also accepted)
+export EQV3_PROF_WAIT=5     # steps skipped entirely — waits out MODEL warmup (compile/cudagraph/cache)
+export EQV3_PROF_WARMUP=5   # steps traced-then-discarded — waits out the PROFILER's own startup cost
+export EQV3_PROF_ACTIVE=20  # steps actually recorded (the sampling window)
+export EQV3_PROF_DIR=./eqv3_prof   # tensorboard trace output dir
+```
+
+Then launch training normally. One cycle = `wait → warmup → active` (default
+5+5+20 steps). After the active window, the log prints the top-25 CUDA kernels
+(`key_averages().table(sort_by="cuda_time_total")`) and a trace is written to
+`EQV3_PROF_DIR`. To A/B a change: run once with it, `git stash` the change and run
+again, compare the `indexFunc*` / triton-scatter kernel times.
+
+---
+
 ## Untracked Baseline `.pt` Files
 
 `compile_dev/_rot_baseline.pt` and `compile_dev/_core_baseline.pt` are
