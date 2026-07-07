@@ -268,10 +268,14 @@ class EquivariantGraphAttention(torch.nn.Module):
         # Radial function
         x_edge_weight = self.rad_func(x_edge)
 
-        # Merge source/target node features
-        x = x.to(x_edge_weight.dtype)
-        x_source = torch.index_select(x, index=edge_index[0], dim=0)
-        x_target = torch.index_select(x, index=edge_index[1], dim=0)
+        # Merge source/target node features.
+        # fp32 岛：gather 在 fp32 下做，其反向 scatter-add 才落在 fp32——bf16 无硬件
+        # atomic-add，反向会退化成慢 aten indexFunc<BFloat16>（~12x）。gather 是纯
+        # permutation，fp32→bf16 与 bf16 gather 前向数值等价，仅改反向 dtype。
+        # fp32/tf32 下 x_edge_weight.dtype 为 fp32，.float()/.to() 皆 no-op。
+        x_f = x.float()
+        x_source = torch.index_select(x_f, index=edge_index[0], dim=0).to(x_edge_weight.dtype)
+        x_target = torch.index_select(x_f, index=edge_index[1], dim=0).to(x_edge_weight.dtype)
         if not self.use_add_merge:
             # Concat    
             x_message = torch.cat((x_source, x_target), dim=2)
