@@ -1,0 +1,250 @@
+dataset:
+  train:
+    format: ase_db
+    src:
+      - /mnt/afs/share/dataset/periodicSystem/MPtrj/aselmdb/train
+    a2g_args:
+      r_energy: True      # already use `uncorrected_total_energy` after pre-processing
+      r_forces: True
+      r_stress: True
+    transforms:
+      normalizer:
+        energy:
+          mean:     0.0
+          rmsd:     0.8124567446457275    # (1) Following eSEN
+                                          # (2) Remove the division after sum aggregation for energy prediction
+        forces:
+          mean:     0.0
+          rmsd:     0.8124567446457275
+        stress:
+          mean:     0.0
+          rmsd:     0.8124567446457275
+
+      element_references:
+        energy:
+          file: experimental/configs/omat24/mptrj/preprocessing/equiformer_v2_mptrj_energy_element_references.npz
+
+  val:
+    format: ase_db
+    src:
+      - /mnt/afs/share/dataset/periodicSystem/MPtrj/aselmdb/val
+    a2g_args:
+      r_energy: True      # already use `uncorrected_total_energy` after pre-processing
+      r_forces: True
+      r_stress: True
+
+
+trainer:              equiformer_v3_dens_trainer
+
+
+logger:
+  name:               wandb
+  project:            equiformer_v3_mptrj
+
+
+hide_eval_progressbar: False
+
+
+evaluation_metrics:
+  primary_metric: forces_mae
+  metrics:
+    energy:
+      - mae
+      - per_atom_mae
+    forces:
+      - mae
+      - cosine_similarity
+    stress:
+      - mae
+
+
+outputs:
+  energy:
+    level:                system
+    property:             energy
+  forces:
+    level:                atom
+    property:             forces
+    train_on_free_atoms:  True
+    eval_on_free_atoms:   True
+  stress:
+    level:                system
+    property:             stress
+
+
+loss_functions:
+  - energy:
+      fn:                 per_atom_mae
+      coefficient:        5      # E:F:S = 5:10:100 (unchanged from the 25ep base; loss-weight is a SEPARATE axis)
+  - forces:
+      fn:                 l2mae
+      coefficient:        10
+  - stress:
+      fn:                 mae
+      coefficient:        100
+
+
+model:
+  name:                         equiformer_v3_dens
+
+  use_pbc:                      True
+  use_pbc_single:               True
+  otf_graph:                    True
+
+  regress_forces:               True
+  regress_stress:               True
+  direct_prediction:            True
+
+  max_neighbors:                300
+  max_radius:                   6.0
+  num_radial_basis:             10
+  max_num_elements:             128
+
+  num_layers:                   7
+  num_channels:                 128
+  attn_hidden_channels:         32
+  num_heads:                    8
+  attn_alpha_channels:          64
+  attn_value_channels:          16
+  ffn_hidden_channels:          512
+  norm_type:                    'merge_layer_norm'
+
+  lmax:                         4
+  mmax:                         2
+  attn_grid_resolution_list:    [14,  8]
+  ffn_grid_resolution_list:     [14, 14]
+
+  edge_channels:                128
+  use_atom_edge_embedding:      True
+  use_envelope:                 True
+
+  attn_activation:              'sep-merge_gates2_swiglu'
+  use_attn_renorm:              True
+  use_add_merge:                False
+  use_rad_l_parametrization:    True
+  softcap:                      null
+  ffn_activation:               'sep-merge_gates2_swiglu'
+  use_grid_mlp:                 True
+
+  use_gate_force_head:          True
+
+  alpha_drop:                   0.0
+  attn_mask_rate:               0.0
+  attn_weights_drop:            0.1
+  value_drop:                   0.0
+  drop_path_rate:               0.05
+  proj_drop:                    0.0
+  ffn_drop:                     0.0
+
+  gradient_checkpointing_block_list:    [0, 0, 0, 0, 0, 0, 0]   # direct = fp16 + single backward + no double-backward:
+                                                                # bs=32 fits on A100-80GB (the 25ep run proved it). Keep OFF.
+
+  enforce_max_neighbors_strictly:       True
+
+  avg_num_nodes:                1
+
+
+optim:
+  batch_size:                   32      # per-GPU; run on 16 GPU -> global 512 (SAME as the 25ep base and every prior 30M run).
+  grad_accumulation_steps:      1
+  eval_batch_size:              32
+  load_balancing:               atoms
+  num_workers:                  0       # lmdb env not fork-safe -> num_workers>0 segfaults
+  lr_initial:                   0.0002  # AdamW lr for the NON-matrix params (biases, norms, embeddings)
+
+  #####################################################################################
+  #  ===== STABILIZED 70ep MOONLIGHT direct-force pretrain — the "train-it-full" headroom step =====
+  #
+  #  GOAL: undo diff #4 (direct 25 -> 70ep, matching the OFFICIAL horizon) WITHOUT re-triggering
+  #  the deep-model post-convergence runaway that FORCED the 25ep early stop in the first place.
+  #  This is NOT the safe production config (that is the 25ep one); it is the headroom experiment
+  #  toward SOTA. If it survives 70ep, direct is no longer under-trained.
+  #
+  #  WHY 25ep exists at all (recap): Muon's update is gradient-magnitude-INDEPENDENT (no 2nd moment,
+  #  no per-coord adaptive damping — an INHERENT design trade-off, not a bug; see
+  #  docs/N7L4C128_CPS_REGRESSION_ANALYSIS.md §2). Near a converged sharp minimum it keeps taking
+  #  constant-size steps and wanders out: 4e-4 -> ran away ep9.6; 2e-4 -> HEALTHY to ep20
+  #  (val cos 0.756, still rising) then a SLOW self-amplifying runaway ep21 lobotomized it.
+  #  The 25ep panic-fix "decayed the lr out before ep20" — but that also CAPS training at 25ep.
+  #
+  #  THE TWO STABILIZATION LEVERS HERE (from Moonlight arxiv 2502.16982, which trained 16B/5.7T
+  #  tokens with Muon and ZERO loss/grad-norm spikes — i.e. divergence is CONTROLLABLE):
+  #
+  #   (1) γ WEIGHT DECAY  [the real fix].  norm_weight_decay: 1e-3 (below) applies weight decay to
+  #       the RMSNorm/LayerNorm GAINS (γ), which were previously in the no-decay group. Moonlight
+  #       credits exactly this for preventing "excessively high output RMS in each layer" — the
+  #       mechanistic root of the runaway (unbounded layer output RMS -> ever-larger NS-input RMS
+  #       -> constant-size Muon steps that grow in effect). This ATTACKS THE CAUSE, letting the run
+  #       stay in-basin instead of relying on decaying the lr to ~0. Opt-in knob; needs the
+  #       build_hybrid_muon_param_groups / _load_hybrid_muon change (norm_weight_decay).
+  #
+  #   (2) muon_lr RE-LIFT + RELAXED TAIL  [what γ-wd now licenses].  With γ-wd bounding the output
+  #       RMS, we RE-LIFT muon_lr off the divergence-pinned 1.5e-4 back to 2e-4 (the value that was
+  #       HEALTHY through ep20 — it only failed POST-convergence, which is exactly what γ-wd guards),
+  #       and RELAX the steep escape tail lr_min_factor 0.001 -> 0.01 so the late 45 epochs actually
+  #       keep training (a 70ep run must SUSTAIN lr, not front-load-then-decay-out like the 25ep).
+  #
+  #  SAFETY NET UNCHANGED: the ABSOLUTE spike backstop (spike_abs_threshold 4.0 / max_consecutive 10)
+  #  stays — if γ-wd fails to hold, it ABORTS the runaway and best_checkpoint = the pre-runaway peak,
+  #  so a failure still yields a usable ckpt (never a silently-lobotomized run).
+  #
+  #  WATCH ep15-25 (the old collapse band): if max NS-input RMS ramps / val cosine turns down,
+  #  the ladder is: first bump norm_weight_decay 1e-3 -> 2e-3 (more γ damping, cheapest), THEN
+  #  detune muon_lr 2e-4 -> 1.5e-4. Do NOT re-steepen the tail (that just recreates the 25ep cap).
+  #####################################################################################
+  optimizer:                    HybridMuon
+  optimizer_params:
+    weight_decay:               0.001
+    norm_weight_decay:          0.001   # NEW (Moonlight lever): weight decay on the norm gains (γ), which are
+                                        # otherwise in the no-decay group. Bounds per-layer output RMS -> the
+                                        # direct fix for Muon's post-convergence runaway. null/omit = old behaviour.
+    update_scale:               moonlight
+    muon_lr:                    0.0002  # RE-LIFTED 1.5e-4 -> 2e-4. 2e-4 was healthy through ep20 last time and only
+                                        # ran away AFTER convergence (ep21) — precisely the regime γ-wd now guards.
+                                        # This is the "回抬" step: go back UP from the divergence-pinned 1.5e-4 now
+                                        # that a mechanistic stabilizer (γ-wd), not lr-decay-out, holds the basin.
+    momentum:                   0.95
+    nesterov:                   True
+    ns_steps:                   5
+    betas:                      [0.9, 0.95]
+    eps:                        1.0e-8
+    # --- Muon-side divergence guard (unchanged from the 25ep base) ---------------------
+    skip_nonfinite:             True
+    spike_factor:               8.0
+    spike_ema_decay:            0.99
+    spike_warmup_steps:         200
+    spike_max_consecutive_skips: 25
+    spike_abs_threshold:        4.0    # ABSOLUTE runaway backstop — KEPT as the safety net behind γ-wd.
+    spike_abs_max_consecutive:  10
+    log_every:                  200
+  scheduler:                    LambdaLR
+  scheduler_params:
+    lambda_type:                cosine
+    warmup_factor:              0.001
+    warmup_epochs:              0.5
+    lr_min_factor:              0.01    # RELAXED 0.001 -> 0.01: the 25ep used a STEEP tail to "decay OUT before the
+                                        # runaway"; that only makes sense on a short horizon. At 70ep we WANT the
+                                        # late epochs to keep training, and γ-wd (not the steep decay) is now what
+                                        # prevents the runaway. (Back to the original pre-panic tail.)
+
+  max_epochs:                   70    # 25 -> 70: align the OFFICIAL direct horizon (diff #4). The whole point of the
+                                      # stabilization is to make this many epochs survivable. stage-2 = separate gradft.
+  clip_grad_norm:               100
+  ema_decay:                    0.999
+
+  eval_every:                   5000
+
+  use_denoising_pos:            True
+  denoising_pos_params:
+    prob:                       0.5
+    fixed_noise_std:            True
+    std:                        0.025
+    corrupt_ratio:              0.5
+    num_steps:                  50
+    std_low:                    0.01
+    std_high:                   0.5
+    min_num_atoms:              null
+    strict_max_ratio:           0.75
+  denoising_pos_coefficient:    10
+
+  use_compile:                  True
