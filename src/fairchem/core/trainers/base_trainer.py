@@ -801,6 +801,18 @@ class BaseTrainer(ABC):
         if hasattr(self._unwrapped_model, "no_weight_decay"):
             no_wd = self._unwrapped_model.no_weight_decay()
 
+        # Moonlight stability lever (opt-in): apply a small weight decay to norm gains (γ)
+        # to bound per-layer output RMS -> the fix for Muon's post-convergence runaway.
+        # When `norm_weight_decay` is unset, norm_gain_names stays empty -> no behaviour change.
+        norm_weight_decay = optimizer_params.get("norm_weight_decay", None)
+        norm_gain_names: set[str] = set()
+        if norm_weight_decay is not None:
+            for module_name, module in self._unwrapped_model.named_modules():
+                if "norm" in type(module).__name__.lower():
+                    for pname, _ in module.named_parameters(recurse=False):
+                        if pname.endswith("weight"):  # γ / scale, NOT the bias
+                            norm_gain_names.add(f"{module_name}.{pname}")
+
         adamw_lr = self.config["optim"]["lr_initial"]
         muon_lr = optimizer_params.get("muon_lr", adamw_lr)
         param_groups = build_hybrid_muon_param_groups(
@@ -809,6 +821,8 @@ class BaseTrainer(ABC):
             weight_decay=weight_decay,
             adamw_lr=adamw_lr,
             muon_lr=muon_lr,
+            norm_gain_names=norm_gain_names,
+            norm_weight_decay=(norm_weight_decay or 0.0),
         )
 
         if distutils.is_master():
@@ -822,6 +836,19 @@ class BaseTrainer(ABC):
                 f"HybridMuon: {n_muon:,} params on Muon (lr={muon_lr}), "
                 f"{n_adamw:,} params on AdamW (lr={adamw_lr}), weight_decay={weight_decay}"
             )
+            if norm_gain_names:
+                n_norm = sum(
+                    p.numel()
+                    for g in param_groups
+                    if not g["use_muon"] and g["weight_decay"] == (norm_weight_decay or 0.0)
+                    and g["weight_decay"] != 0.0
+                    for p in g["params"]
+                )
+                logging.info(
+                    f"HybridMuon: {len(norm_gain_names)} norm-gain (γ) tensors "
+                    f"({n_norm:,} params) moved to AdamW with weight_decay={norm_weight_decay} "
+                    f"(Moonlight stability lever)"
+                )
 
         muon_kwargs = {
             k: v

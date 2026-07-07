@@ -404,23 +404,37 @@ def build_hybrid_muon_param_groups(
     weight_decay: float,
     adamw_lr: float,
     muon_lr: float,
+    norm_gain_names: set[str] | None = None,
+    norm_weight_decay: float = 0.0,
 ) -> list[dict]:
     """Split a model's parameters into Muon / AdamW groups.
 
     Rule (matches EquiformerV3's ``no_weight_decay`` semantics):
+      * name in ``norm_gain_names`` -> AdamW, weight_decay=norm_weight_decay (norm gains γ)
       * name in ``no_weight_decay``  -> AdamW, weight_decay=0  (biases, norms, embeddings)
       * else ``ndim >= 2``           -> Muon,  weight_decay=wd (Linear/SO3Linear weights)
       * else (leftover 1D)           -> AdamW, weight_decay=wd (rare)
+
+    ``norm_gain_names`` opts specific norm scale/gain (γ) parameters OUT of the no-decay
+    group and INTO a small-weight-decay AdamW group. This is Moonlight's stability lever
+    (arxiv 2502.16982 §"weight decay on RMSNorm gamma"): decaying γ bounds each layer's
+    output RMS and is what let Muon train 16B/5.7T-token with ZERO loss/grad-norm spikes.
+    It takes PRECEDENCE over ``no_weight_decay`` (norm gains live in that set by default).
+    Default ``norm_gain_names=None`` -> behaviour is byte-identical to before (opt-in only).
 
     ``name.endswith(...)`` is used (as elsewhere in the trainer) so that DDP/compile
     prefixes like ``module.`` / ``_orig_mod.`` still match the unwrapped suffix names.
     """
     no_wd = set(no_weight_decay)
-    muon_params, adamw_decay, adamw_no_decay = [], [], []
+    norm_gain = set(norm_gain_names or ())
+    muon_params, adamw_decay, adamw_no_decay, adamw_norm_decay = [], [], [], []
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
-        if any(name.endswith(s) for s in no_wd):
+        # Norm gains (γ) FIRST: they are also in no_wd by default, so this override must win.
+        if norm_gain and any(name.endswith(s) for s in norm_gain):
+            adamw_norm_decay.append(p)
+        elif any(name.endswith(s) for s in no_wd):
             adamw_no_decay.append(p)
         elif p.ndim >= 2:
             muon_params.append(p)
@@ -435,6 +449,11 @@ def build_hybrid_muon_param_groups(
     if adamw_decay:
         groups.append(
             dict(params=adamw_decay, use_muon=False, lr=adamw_lr, weight_decay=weight_decay)
+        )
+    if adamw_norm_decay:
+        groups.append(
+            dict(params=adamw_norm_decay, use_muon=False, lr=adamw_lr,
+                 weight_decay=norm_weight_decay)
         )
     if adamw_no_decay:
         groups.append(
