@@ -624,7 +624,10 @@ class EquiformerV3_OC(torch.nn.Module, GraphModelMixin):
             1.  We have additional `@conditional_grad` as the decorator since the decorator might not be compatible with
                 `torch.compile()` in direct methods.
         """
-        if self.enable_compile:
+        # 仅训练态走保守力编译区（该区以 create_graph=True 编译整段双反向，供外层 param 反向用）。
+        # eval 无外层 backward，改走下方 eager 路径（create_graph=self.training=False）—— 不建双反向图、
+        # 不触发编译，消除首次 eval 的显存尖峰。对齐 DPA4 should_use_compile 的 self.training 门控。
+        if self.enable_compile and self.training:
             return self._conservative_compiled_forward(data)
 
         self.batch_size = len(data.natoms)
