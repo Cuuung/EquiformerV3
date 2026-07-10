@@ -462,6 +462,11 @@ class EquiformerV3DeNSTrainer(EquiformerV2ForcesTrainer):
             )
             _prof.start()
 
+        # 峰值显存探针（env 开关，默认 no-op；镜像 esen 的 ESEN_MEM_PROBE）。每 print_every 打印
+        # 累计 max_allocated（真实张量峰值）与 max_reserved（含 cudagraph 静态池/碎片），用于分辨
+        # budget/compile 下显存膨胀是真张量还是 reserved。仅 master rank。
+        _mprobe = os.environ.get("EQV3_MEM_PROBE", os.environ.get("ESEN_MEM_PROBE", "0")) == "1"
+
         for epoch_int in range(
             start_epoch, self.config["optim"]["max_epochs"]
         ):
@@ -609,6 +614,16 @@ class EquiformerV3DeNSTrainer(EquiformerV2ForcesTrainer):
 
                 if _prof is not None:
                     _prof.step()
+
+                if (
+                    _mprobe
+                    and self.step % self.config["cmd"]["print_every"] == 0
+                    and distutils.is_master()
+                ):
+                    logging.info(
+                        f"[MEM] max_allocated={torch.cuda.max_memory_allocated() / 1e9:.2f}GB "
+                        f"max_reserved={torch.cuda.max_memory_reserved() / 1e9:.2f}GB"
+                    )
 
             # torch.cuda.empty_cache()
 
