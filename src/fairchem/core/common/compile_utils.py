@@ -60,6 +60,15 @@ def configure_dynamo_for_compile(optimize_ddp: bool = False) -> None:
     # 用来确认「真的在编译」。默认不动 dynamo 行为。
     if os.environ.get("ESEN_COMPILE_PROBE", "0") == "1":
         torch._dynamo.config.suppress_errors = False
+    # EQV3_ACT_MEM_BUDGET：AOTAutograd min-cut partitioner 的 activation_memory_budget
+    # （默认 1.0=runtime 最优、几乎不重算）。调低（如 0.6/0.5）让 partitioner 解 0-1 背包、
+    # 用重算换显存，治保守力 make_fx 图的 saved-tensor 膨胀。等价于 esen 侧的同名旋钮，故也接受
+    # ESEN_ACT_MEM_BUDGET 别名。torch 自校验范围 [0,1]。不设则不碰（no-op）。
+    _amb = os.environ.get("EQV3_ACT_MEM_BUDGET") or os.environ.get("ESEN_ACT_MEM_BUDGET")
+    if _amb is not None:
+        import torch._functorch.config as _ft_config
+
+        _ft_config.activation_memory_budget = float(_amb)
 
 
 # --------------------------------------------------------------------------- #
