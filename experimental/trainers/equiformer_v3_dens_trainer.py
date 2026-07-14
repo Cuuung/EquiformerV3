@@ -595,6 +595,11 @@ class EquiformerV3DeNSTrainer(EquiformerV2ForcesTrainer):
                             disable_eval_tqdm=disable_eval_tqdm,
                         )
 
+                        # release the val-phase activation blocks the caching
+                        # allocator is holding, so reserved footprint drops back
+                        # to the train level instead of staying at the val peak.
+                        torch.cuda.empty_cache()
+
                     if self.config["task"].get("eval_relaxations", False):
                         if "relax_dataset" not in self.config["task"]:
                             logging.warning(
@@ -624,8 +629,6 @@ class EquiformerV3DeNSTrainer(EquiformerV2ForcesTrainer):
                         f"[MEM] max_allocated={torch.cuda.max_memory_allocated() / 1e9:.2f}GB "
                         f"max_reserved={torch.cuda.max_memory_reserved() / 1e9:.2f}GB"
                     )
-
-            # torch.cuda.empty_cache()
 
             if checkpoint_every == -1:
                 self.save(checkpoint_file="checkpoint.pt", training_state=True)
