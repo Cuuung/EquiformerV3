@@ -76,7 +76,7 @@ dataset:
       r_energy: True      # already use `uncorrected_total_energy` after pre-processing
       r_forces: True
       r_stress: True
-
+    max_atoms: 150
 
 trainer:              equiformer_v3_dens_trainer
 
@@ -196,7 +196,7 @@ model:
   enforce_max_neighbors_strictly:       True
 
   avg_num_nodes:                1       # Remove the division after sum aggregation over nodes for energy prediction
-  enable_compile:               False    # in-model make_fx 区域编译（新 compile；与 optim.use_compile 互斥，故下方 use_compile 关）。
+  enable_compile:               True    # in-model make_fx 区域编译（新 compile；与 optim.use_compile 互斥，故下方 use_compile 关）。
                                         # 本分支目的：让保守力 double-backward 在 dynamic=True symbolic 路径下跑通（需 torch>=2.11）。
   compile_dynamic:              True    # plain_compile(dynamic=True)：动态 shape 编译（否则每种 shape 重编译）
   use_amp:                      False    # 块级 bf16 autocast（DPA4 式，无 GradScaler）：只包交互块，Wigner-D/几何留 fp32、
@@ -326,7 +326,7 @@ optim:
   denoising_pos_coefficient:    10
 
   use_compile:                  False   # CHANGED: torch.compile is unstable with the double backward of gradient forces
-  matmul_precision:             highest
+  matmul_precision:             high
   #####################################################################################
   #  Stage-1 direct-force checkpoint to finetune from.
   #  NOTE: when launched via the two-stage pipeline script this path is OVERRIDDEN on the
@@ -336,4 +336,3 @@ optim:
   #  direct force/stress/dens heads auto-skipped. If an energy_block shape assert fires,
   #  strip energy_block keys from the ckpt first ("no-energy_block").
   #####################################################################################
-  load_pretrained_weights:      /mnt/afs/share/checkpoint/equiformerV3/yaolekai/checkpoints/2026-07-02-01-36-00-adamw_refine_N7L4C128_direct_CONT_15ep_lr1.5e-5_from-ep20peak/best_checkpoint.pt
