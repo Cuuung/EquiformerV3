@@ -298,4 +298,3 @@ optim:
   #  direct force/stress/dens heads auto-skipped. If an energy_block shape assert fires,
   #  strip energy_block keys from the ckpt first ("no-energy_block").
   #####################################################################################
-  load_pretrained_weights:      /mnt/afs/share/checkpoint/equiformerV3/yaolekai/checkpoints/2026-06-07-11-24-48-mptrj_direct_N@2_L@2_C@64_60ep/best_checkpoint.pt
