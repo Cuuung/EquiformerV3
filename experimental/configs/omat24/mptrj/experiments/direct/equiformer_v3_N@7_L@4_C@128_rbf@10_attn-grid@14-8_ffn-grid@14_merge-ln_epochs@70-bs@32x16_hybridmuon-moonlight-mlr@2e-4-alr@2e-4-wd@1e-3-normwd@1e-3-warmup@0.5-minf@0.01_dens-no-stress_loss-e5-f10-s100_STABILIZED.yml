@@ -142,6 +142,9 @@ model:
   enforce_max_neighbors_strictly:       True
 
   avg_num_nodes:                1
+  enable_compile:               True    # in-model make_fx 区域编译（新 compile；与 optim.use_compile 互斥，故下方 use_compile 关）
+  compile_dynamic:              True    # plain_compile(dynamic=True)：动态 shape 编译
+  use_amp:                      True    # 块级 bf16 autocast（DPA4 式，无 GradScaler；与 optim.amp/fp16 互斥，故本档不开 amp）
 
 
 optim:
@@ -247,4 +250,6 @@ optim:
     strict_max_ratio:           0.75
   denoising_pos_coefficient:    10
 
-  use_compile:                  True
+  use_compile:                  False
+  matmul_precision:             high    # TF32：加速 fp32 matmul（默认 highest=纯 fp32）
+                                        # 注意：本档用 bf16(model.use_amp)，不开 optim.amp/fp16（两者互斥）
