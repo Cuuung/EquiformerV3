@@ -69,3 +69,4 @@ metadata*.npz
 
 # profiler traces (EQV3_PROF / ESEN_PROF output) — multi-GB, dev artifacts only
 docs/train_speed_analysis/**/*.trace.json
+docs/train_speed_analysis/**/*.png
