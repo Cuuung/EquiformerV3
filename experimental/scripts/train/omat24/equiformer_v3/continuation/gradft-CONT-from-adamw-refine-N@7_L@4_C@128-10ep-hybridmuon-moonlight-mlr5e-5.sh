@@ -48,10 +48,10 @@ python -c "import inspect, fairchem.core.trainers.base_trainer as bt; assert 'Hy
 RUN_DIR='/mnt/afs/share/checkpoint/equiformerV3/maoruicong'   # outputs -> your dir
 
 GRADFT_CFG='experimental/configs/omat24/mptrj/experiments/gradient/equiformer_v3_grad-finetune_N@7_L@4_C@128_rbf@10_attn-grid@14-8_ffn-grid@14_merge-ln_CONT-from-adamw-refine_epochs@10-bs@8x16x4-maxatoms150_hybridmuon-moonlight-mlr@5e-5-alr@5e-5-wd@1e-3_loss-e5-f10-s100.yml'
-GRADFT_ID='muon_N7L4C128_gradft_10ep_moonlight_mlr5e-5_maxatoms150_bs8x16x4_from-adamw-refine'
+GRADFT_ID='muon_N7L4C128_gradft_10ep_moonlight_mlr5e-5_maxatoms150_bs8x16x4_from-adamw-refine_direct_bf16'
 
 # START = the 07-02 AdamW low-lr DIRECT refine best_checkpoint (weights-only, backbone+energy_block transfer).
-START_CKPT='/mnt/afs/share/checkpoint/equiformerV3/yaolekai/checkpoints/2026-07-02-01-36-00-adamw_refine_N7L4C128_direct_CONT_15ep_lr1.5e-5_from-ep20peak/best_checkpoint.pt'
+START_CKPT='/mnt/afs/share/checkpoint/equiformerV3/maoruicong/checkpoints/2026-07-07-07-02-24-muon_N7L4C128_direct_70ep_moonlight_mlr2e-4_normwd1e-3_STABILIZED/best_checkpoint.pt'
 ##############################################################################
 
 if [[ ! -s "$START_CKPT" ]]; then

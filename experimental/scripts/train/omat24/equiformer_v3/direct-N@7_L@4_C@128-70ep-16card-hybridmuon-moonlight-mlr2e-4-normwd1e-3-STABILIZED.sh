@@ -37,14 +37,15 @@
 ###############################################################################
 set -euo pipefail
 
-cd /mnt/afs/home/yaolekai/MLIP/equiformer_v3
+REPO=/mnt/afs/home/maoruicong/LAM_understanding/repositories/equiformer_v3
+cd "$REPO"
 
 # --- wandb egress fix: strip any dev-machine proxy leaked from the submit shell --
 unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY
 
 # DO NOT pip install: the docker image bakes in an OLD fairchem. PYTHONPATH is searched
 # before site-packages, so point it at this repo's src to override the image.
-export PYTHONPATH=/mnt/afs/home/yaolekai/MLIP/equiformer_v3/src:${PYTHONPATH:-}
+export PYTHONPATH="$REPO/src:${PYTHONPATH:-}"
 # Reduce CUDA fragmentation.
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
@@ -59,7 +60,7 @@ assert 'norm_gain_names' in src_mu, 'fairchem too OLD: muon.py lacks norm_gain_n
 print('[stabilized] fairchem OK (norm_weight_decay path present):', bt.__file__)"
 
 ############################## EDIT THESE #####################################
-RUN_DIR='/mnt/afs/share/checkpoint/equiformerV3/yaolekai'
+RUN_DIR='/mnt/afs/share/checkpoint/equiformerV3/maoruicong'
 
 DIRECT_CFG='experimental/configs/omat24/mptrj/experiments/direct/equiformer_v3_N@7_L@4_C@128_rbf@10_attn-grid@14-8_ffn-grid@14_merge-ln_epochs@70-bs@32x16_hybridmuon-moonlight-mlr@2e-4-alr@2e-4-wd@1e-3-normwd@1e-3-warmup@0.5-minf@0.01_dens-no-stress_loss-e5-f10-s100_STABILIZED.yml'
 DIRECT_ID='muon_N7L4C128_direct_70ep_moonlight_mlr2e-4_normwd1e-3_STABILIZED'
@@ -81,11 +82,11 @@ MAIN_COMMON=(
 )
 
 ###############################################################################
-# DIRECT (--amp ON, fp16)
+# DIRECT (--amp off, use bf16 instead of fp16)
 ###############################################################################
 echo "[stabilized] ===== DIRECT pretrain 70ep ($DIRECT_ID) ====="
 torchrun "${TORCHRUN_COMMON[@]}" \
-  my_main.py --mode train --config-yml "$DIRECT_CFG" --amp \
+  my_main.py --mode train --config-yml "$DIRECT_CFG" \
   "${MAIN_COMMON[@]}" \
   --identifier "$DIRECT_ID"
 
