@@ -152,6 +152,13 @@ class BaseTrainer(ABC):
             "slurm": slurm,
             "gp_gpus": gp_gpus,
         }
+        # fp32 matmul precision: "highest" (pure fp32, default) | "high" (TF32) | "medium".
+        # Global flag, applies to both eager and torch.compile; affects fp32 matmuls only.
+        matmul_precision = optimizer.get("matmul_precision", "highest")
+        if matmul_precision != "highest":
+            torch.set_float32_matmul_precision(matmul_precision)
+            logging.info(f"Set float32 matmul precision to '{matmul_precision}'")
+
         # AMP Scaler
         self.scaler = torch.GradScaler("cuda") if amp and not self.cpu else None
 
@@ -419,6 +426,22 @@ class BaseTrainer(ABC):
             self.val_dataset = registry.get_dataset_class(
                 val_config.get("format", "lmdb")
             )(val_config)
+
+            # for removing certain examples with number of atoms > `max_atoms`
+            if val_config.get("max_atoms", None):
+                indices = self.val_dataset.indices
+                max_atoms = val_config.get("max_atoms", None)
+                if not self.val_dataset.metadata_hasattr("natoms"):
+                    raise ValueError("Cannot use max_atoms without dataset metadata")
+                indices = indices[self.val_dataset.get_metadata("natoms", indices) <= max_atoms]
+                self.val_dataset = Subset(
+                    self.val_dataset,
+                    indices,
+                    metadata=self.val_dataset._metadata
+                )
+                if distutils.is_master():
+                    logging.info('Use val max_atoms={}'.format(max_atoms))
+
             self.val_sampler = self.get_sampler(
                 self.val_dataset,
                 self.config["optim"].get(

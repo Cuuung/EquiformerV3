@@ -63,10 +63,8 @@ dataset:
         energy:
           file: experimental/configs/omat24/mptrj/preprocessing/equiformer_v2_mptrj_energy_element_references.npz
 
-    max_atoms: 150        # CHANGED 24000->150: old cap was INERT (MPtrj max natoms=444, mean 31, p99=144,
-                          # so 24000 filtered ZERO structures). Paper excludes >24000 EDGES; with no otf edge
-                          # filter we proxy in atom-space. 150 drops only 0.82% (11.7k/1.42M) -- the 150-444
-                          # atom tail that is the fp32 double-backward memory monster behind the step-0 OOM.
+    max_atoms: 150        # ABLATION (mirrors the 30M recipe): 24000 was INERT (MPtrj max natoms=444). 150 drops only ~0.82% (the large-cell
+                          # tail) so the data pipeline matches the 30M gradft. Not needed for OOM on N2L2C64 (tiny model), kept for recipe fidelity.
 
   val:
     format: ase_db
@@ -76,7 +74,7 @@ dataset:
       r_energy: True      # already use `uncorrected_total_energy` after pre-processing
       r_forces: True
       r_stress: True
-    max_atoms: 150
+
 
 trainer:              equiformer_v3_dens_trainer
 
@@ -150,8 +148,8 @@ model:
   num_radial_basis:             10
   max_num_elements:             128
 
-  num_layers:                   7          # CHANGED 2 -> 7 : paper ~30M model; MUST match direct stage-1 for weight transfer
-  num_channels:                 128        # CHANGED 64 -> 128 : paper d_embed (4, 128); MUST match direct stage-1
+  num_layers:                   2          # identical to direct stage-1
+  num_channels:                 64
   attn_hidden_channels:         32
   num_heads:                    8
   attn_alpha_channels:          64
@@ -159,7 +157,7 @@ model:
   ffn_hidden_channels:          512
   norm_type:                    'merge_layer_norm'  # ['sep_layer_norm', 'sep_layer_norm_liger']
 
-  lmax:                         4          # CHANGED 2 -> 4 : paper Lmax=4; MUST match direct stage-1
+  lmax:                         2
   mmax:                         2
   attn_grid_resolution_list:    [14,  8]
   ffn_grid_resolution_list:     [14, 14]
@@ -189,19 +187,15 @@ model:
   proj_drop:                    0.0
   ffn_drop:                     0.0
 
-  gradient_checkpointing_block_list:    [1, 1, 1, 1, 1, 1, 1]   # length == num_layers (7). ON for the 30M model:
-                                                                # fp32 double-backward gradient force is the heaviest stage,
-                                                                # checkpointing keeps per-GPU batch at 32 (global 512) without OOM.
+  gradient_checkpointing_block_list:    [0, 0]      # length == num_layers; set [1,1] to trade compute for memory
 
   enforce_max_neighbors_strictly:       True
 
   avg_num_nodes:                1       # Remove the division after sum aggregation over nodes for energy prediction
+
   enable_compile:               True    # in-model make_fx 区域编译（新 compile；与 optim.use_compile 互斥，故下方 use_compile 关）。
                                         # 本分支目的：让保守力 double-backward 在 dynamic=True symbolic 路径下跑通（需 torch>=2.11）。
   compile_dynamic:              True    # plain_compile(dynamic=True)：动态 shape 编译（否则每种 shape 重编译）
-  use_amp:                      False    # 块级 bf16 autocast（DPA4 式，无 GradScaler）：只包交互块，Wigner-D/几何留 fp32、
-                                        # 块输出再转回 fp32，故不触发 fp16 那条 so3.rotate bmm(half,float) 失配。与 optim.amp/fp16
-                                        # 互斥（trainer 有护栏），故本档启动脚本 **不要** 加 --amp。保守力双反向 + bf16 尚未实测，属验证项。
 
 
 optim:
@@ -210,73 +204,41 @@ optim:
   #  amp crashes Wigner construction in so3.py with a Float/Half index_put mismatch).
   #  MEMORY note: per-GPU memory depends on per-GPU batch_size, NOT GPU count -- adding
   #  GPUs only grows global batch/throughput, it does NOT reduce single-card usage.
-  #  This is the PAPER ~30M model (Lmax=4, 7 layers) -- the heaviest config -- so batch
-  #  32/GPU is held high (global 512, near the paper) ONLY because gradient_checkpointing_
-  #  block_list=[1]x7 is enabled above (trades ~20-30% compute for the memory headroom).
-  #  THIS RUN: batch DROPPED 32->16 + grad_accumulation_steps=2 (= effective 512) because bs=32 OOMd:
-  #  grad-ft = conservative-force DOUBLE backward (create_graph) + fp32 (no --amp, Wigner) ~ 3-4x direct's
-  #  per-sample memory; checkpointing helps little under create_graph. bs=16 halves the peak activation.
+  #  On the real MPtrj train split (large structures, max_atoms 24000, load_balancing
+  #  atoms) batch 32/GPU pushed close to 100% (OOM risk), so per-GPU batch is set to 16
+  #  for headroom. To push higher (24-32) without OOM, enable gradient_checkpointing_
+  #  block_list: [1, 1] above (trades compute for memory).
   #####################################################################################
-  batch_size:                   8       # per-GPU; fp32. 32->16->8: bs16+max_atoms150 STILL OOMd @step0 (recompute, 259MB free); bs=8 halves peak activation.
-  grad_accumulation_steps:      4        # 8/GPU x 16 GPU x 4 = effective global 512 (paper bs preserved -> muon_lr calibration unchanged)
-  eval_batch_size:              8       # eval ALSO runs the conservative-force backward (forces=autograd) -> same OOM risk; match train bs=8
+  batch_size:                   16      # per-GPU; fp32. 8 GPU x 16 x accum4 = global 512 (mirrors the 30M gradft global batch). N2L2C64 is tiny -> no OOM.
+  grad_accumulation_steps:      4
+  eval_batch_size:              16
   load_balancing:               atoms
   num_workers:                  0       # lmdb env not fork-safe -> num_workers>0 segfaults
   lr_initial:                   0.00005 # 5e-5: AdamW lr for the NON-matrix params (biases, norms, embeddings)
 
   #####################################################################################
-  #  ===== MOONLIGHT gradient-force finetune, 10ep, 16 GPU (8x16x4 = global 512) ======
-  #
-  #  LINEAGE (why this file exists): this is the grad-ft (stage-2) that CHAINS FROM the
-  #  AdamW low-lr DIRECT refinement, whose lineage is:
-  #     ep20 peak (06-20 mlr@2e-4/35ep best_ckpt, fp32 cos 0.7664/fmae 0.0253)
-  #       --AdamW refine 15ep lr1.5e-5-->  07-02 adamw_refine best_ckpt (this run's START).
-  #  The submit script OVERRIDES load_pretrained_weights on the CLI to that adamw_refine
-  #  best_checkpoint.pt (path in `load_pretrained_weights` below is the same, for standalone).
-  #  WHY MUON IS OK HERE (unlike the Scheme-S same-objective refine that diverged): grad-ft
-  #  CHANGES the objective (direct forces -> conservative -dE/dx autograd forces), so the
-  #  weights are NOT sitting at a converged minimum for the NEW loss -- there is a real
-  #  gradient to descend, so Muon's gradient-magnitude-blind constant step is fine (it is a
-  #  genuine re-optimization, not settling into an existing basin). Muon has BEATEN AdamW on
-  #  N2L2C64 grad-ft (fmae 0.0406->0.0343, -15.5%). Recipe below is UNCHANGED from the proven
-  #  stage-2 config; only the start checkpoint (adamw_refine) + this header differ.
-  #  --- original stage-2 note ---
-  #  Derived from the ratio gradft config (...hybridmuon-mlr@1e-3...epochs@40...), with:
-  #    (1) optimizer_params.update_scale: "ratio" -> "moonlight"
-  #    (2) optimizer_params.muon_lr:     1e-3     -> 5e-5  (= paper AdamW grad lr; ~0.33x the stage-1 direct mlr 1.5e-4; see below)
-  #    (3) max_epochs 40 -> 10.
-  #  Everything else (arch, fp32, no compile, alr 5e-5) is unchanged.
-  #
-  #  WHY muon_lr=5e-5 (= paper AdamW grad lr; ~0.33x the stage-1 direct mlr=1.5e-4): this is a FINETUNE
-  #  from a converged direct-force ckpt, not a from-scratch pretrain. Finetune wants a smaller step
-  #  so it does not knock the model out of the basin it already found -- the AdamW side already does
-  #  this (lr_initial 2e-4 -> 5e-5). EXTRA caution: conservative-force (gradient) loss is a 2nd
-  #  derivative through the net -> a SHARPER, more step-sensitive landscape; and the deep model
-  #  (N=7,Lmax=4) has diverged POST-CONVERGENCE at every higher muon_lr tried (4e-4->ep9.6, 2e-4->ep21).
-  #  moonlight's per-element scaling holds across width but not depth. So gradft runs muon=1xAdamW
-  #  (more conservative than direct's 0.75xAdamW); 10ep is short so survival is not the concern.
+  #  Muon counterpart of the 40ep AdamW grad-ft config, shortened to 25 epochs:
+  #    ...pt-dens-ft-no-reg_lr@5e-5-epochs@40-bs@16x16-wd@1e-3-beta2@0.95_loss-e5-f10-s100.yml
+  #  Differences vs that AdamW config: optimizer block below (HybridMuon) + its lr, and
+  #    max_epochs 40 -> 25. Everything else (arch, batch 16/GPU, fp32, no compile) is the same.
   #
   #  HybridMuon: Muon (Newton-Schulz orthogonalized momentum) for the weight matrices
   #  (nn.Linear 2D + SO3Linear 3D), AdamW for biases / norms / embeddings.
   #  - This is a FINETUNE from the direct-force checkpoint, so lr is kept low.
-  #  - lr_initial (above) is the AdamW lr applied to the non-matrix params (5e-5).
+  #    muon_lr 5e-3 keeps the same ~100x matrix:AdamW ratio used by the direct config
+  #    (2e-2 / 2e-4). muon_lr is the main knob -- lower it (e.g. 2e-3) if the loaded
+  #    weights get disturbed too fast.
+  #  - lr_initial (above) is the AdamW lr applied to the non-matrix params.
   #  - fp32 only (no --amp). Under plain DDP this is correct (grads all-reduced before
   #    step -> identical Muon updates on every rank). use_compile stays OFF (double
   #    backward of gradient forces is unstable with torch.compile).
-  #  - global batch here is 512 (32/GPU x16, held high via checkpointing); the update is norm-normalized
-  #    so per-step magnitude is batch-INDEPENDENT, but if epoch-1 shows "Found nans" /
-  #    many SKIPPED, drop muon_lr (e.g. 5e-5) -- it is the main knob.
   #####################################################################################
   optimizer:                    HybridMuon
   optimizer_params:
     weight_decay:               0.001
-    update_scale:               moonlight # CHANGED "ratio" -> "moonlight": shape-decoupled update scaling 0.2*sqrt(max(rows,cols))
-                                          # (update RMS ~0.17*lr for every matrix). REQUIRES the re-calibrated muon_lr below.
-    muon_lr:                    0.00005   # 5e-5 = stage-1 direct's now-1.5e-4 x ~0.33 ~= the paper's AdamW grad lr (5e-5), i.e. muon=1xAdamW
-                                          # here (vs 0.75xAdamW on direct) -- deliberately MORE conservative: conservative-force loss is a
-                                          # 2nd derivative through the net (SHARPER, more step-sensitive), and the deep model has diverged
-                                          # post-convergence at every higher lr. fp32 + converged init is extra-safe; 10ep is short so survival
-                                          # is not the concern, NOT-knocking-the-model-out is. Watch ep1 for growing SKIPPED / "Found nans".
+    update_scale:               moonlight # ABLATION: ratio -> moonlight (shape-decoupled 0.2*sqrt(max(rows,cols))). REQUIRES the moonlight muon_lr below.
+    muon_lr:                    0.00015   # moonlight gradft = direct(4e-4) x ~0.33 ~= 1.5e-4, mirroring the 30M recipe's direct->gradft ratio (1.5e-4->5e-5).
+                                          # Finetune from a converged ckpt -> conservative step. muon_lr is the main knob; watch ep1 for "Found nans"/SKIPPED.
     momentum:                   0.95      # Muon momentum
     nesterov:                   True      # Muon nesterov look-ahead
     ns_steps:                   5         # Newton-Schulz iterations
@@ -290,13 +252,8 @@ optim:
     spike_factor:               8.0    # skip a matrix when its Newton-Schulz-input RMS jumps >8x its EMA
     spike_ema_decay:            0.99   # EMA decay for the per-matrix RMS baseline
     spike_warmup_steps:         200    # no spike-skips until the EMA has stabilized
-    spike_max_consecutive_skips: 25    # deadlock backstop (fixes the 40ep stall): force-commit + re-baseline a matrix after 25 consecutive skips
-    spike_abs_threshold:        15.0   # ABSOLUTE runaway backstop: abort if per-step MAX NS-input RMS stays >15.0 for
-                                       #   spike_abs_max_consecutive steps -- catches the slow runaway the 8x-EMA guard self-disarms on. null disables.
-                                       #   RAISED 4.0 -> 15.0 (07-03): grad-ft continuation is a genuine re-optimization (conservative-force objective
-                                       #   change), so NS-input RMS (= raw momentum RMS; moonlight normalizes only the OUTPUT, so muon_lr does NOT lower it)
-                                       #   sits naturally flat at ~6-7.4 here (measured step200-209, no skips) -> 4.0 false-aborted @step209. 15.0 clears the
-                                       #   baseline with margin while still capping a true unbounded runaway.
+    spike_max_consecutive_skips: 25    # deadlock backstop: force-commit + re-baseline a matrix after 25 consecutive skips
+    spike_abs_threshold:        null   # DISABLED for N2L2C64 (abs=4.0 is a 30M tuning; small-model NS-input RMS naturally ~5-8 -> false abort). skip_nonfinite + 8x-EMA stay on.
     spike_abs_max_consecutive:  10     # consecutive over-threshold steps before abort
     log_every:                  200    # master-rank periodic "max NS-input RMS" log (skips always logged)
   scheduler:                    LambdaLR
@@ -306,7 +263,7 @@ optim:
     warmup_epochs:              0.1
     lr_min_factor:              0.01
 
-  max_epochs:                   10      # 10ep gradient-force finetune (moonlight stage-2; matches the paper's 10ep gradft budget)
+  max_epochs:                   5       # ABLATION: short 5ep gradient-force finetune (cheap N2L2C64 proxy of the 30M 10ep gradft)
   clip_grad_norm:               100
   ema_decay:                    0.999
 
@@ -325,8 +282,9 @@ optim:
     strict_max_ratio:           0.75
   denoising_pos_coefficient:    10
 
-  use_compile:                  False   # CHANGED: torch.compile is unstable with the double backward of gradient forces
-  matmul_precision:             high
+  use_compile:                  False   # 外层老 torch.compile 关闭（与 model.enable_compile 互斥）。保守力双反向改由上面的
+                                        # 新 in-model enable_compile(dynamic=True) 承担；老 use_compile 对 double backward 不稳。
+
   #####################################################################################
   #  Stage-1 direct-force checkpoint to finetune from.
   #  NOTE: when launched via the two-stage pipeline script this path is OVERRIDDEN on the

@@ -22,6 +22,12 @@ class GraphDropPath(torch.nn.Module):
 
 
     def forward(self, x, batch):
+        # Early-out before the data-dependent `batch.max()` so the no-op case is
+        # make_fx-traceable (conservative-compile path). Mirrors EquivariantDropout
+        # and is numerically identical: drop_path() already returns x untouched
+        # when drop_prob==0 / eval.
+        if self.drop_prob == 0. or not self.training:
+            return x
         batch_size = batch.max() + 1
         shape = (batch_size, ) + (1, ) * (x.ndim - 1)  # work with different dim tensors
         ones = torch.ones(shape, dtype=x.dtype, device=x.device)

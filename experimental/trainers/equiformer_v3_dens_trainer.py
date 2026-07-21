@@ -1,4 +1,5 @@
 import logging
+import os
 from dataclasses import dataclass
 from collections import defaultdict
 from typing import Optional
@@ -376,13 +377,41 @@ class EquiformerV3DeNSTrainer(EquiformerV2ForcesTrainer):
         )
         self.normalizers["denoising_pos_target"].to(self.device)
 
-        if self.config['optim'].get('use_compile', False):
+        self._setup_compile()
+
+    def _setup_compile(self):
+        """Mutually-exclusive compile dispatch.
+
+        - ``optim.use_compile`` (outer torch.compile) and
+          ``model.enable_compile`` (in-model make_fx region) conflict when
+          both are enabled: the outer retrace collides with the
+          already-make_fx-compiled inner region.
+        - Exactly one (or neither) may be set.
+        """
+        enable_compile = self.config.get('model', {}).get('enable_compile', False)
+        use_compile = self.config['optim'].get('use_compile', False)
+        if use_compile and enable_compile:
+            raise ValueError(
+                "optim.use_compile (outer torch.compile) 与 model.enable_compile "
+                "(in-model make_fx) 互斥，不能同开。二选一。")
+        if use_compile and not enable_compile:
             self.model = torch.compile(self.model, dynamic=True)
             torch._dynamo.config.optimize_ddp = False
-
+        elif enable_compile:
+            torch._dynamo.config.optimize_ddp = False
 
     def train(self, disable_eval_tqdm=False):
         ensure_fitted(self._unwrapped_model, warn=True)
+
+        # 护栏：trainer 级 optim.amp(整图 fp16+GradScaler) 与 model.use_amp
+        # (块级 bf16，DPA4 式) 互斥，同时开会嵌套冲突且 GradScaler 对 bf16 无意义。
+        if self.config["optim"].get("amp", False) and self.config.get(
+            "model", {}
+        ).get("use_amp", False):
+            raise ValueError(
+                "optim.amp (fp16+GradScaler) 与 model.use_amp (bf16) 不能同时开启，"
+                "请二选一：bf16 用 model.use_amp，fp16 用 optim.amp。"
+            )
 
         eval_every = self.config["optim"].get(
             "eval_every", len(self.train_loader)
@@ -405,6 +434,38 @@ class EquiformerV3DeNSTrainer(EquiformerV2ForcesTrainer):
         # Calculate start_epoch from step instead of loading the epoch number
         # to prevent inconsistencies due to different batch size in checkpoint.
         start_epoch = self.step // len(self.train_loader)
+
+        # torch.profiler 探针（env 开关，默认 no-op；仅 master rank）。镜像 esen 的
+        # ESEN_PROF：EQV3_PROF=1 开启，schedule(wait/warmup/active) 跳过 compile 未稳的
+        # 前若干步，on_trace_ready 打 kernel 表（按 cuda_time_total 排序）+ 存 trace。
+        _prof = None
+        if os.environ.get("EQV3_PROF", os.environ.get("ESEN_PROF", "0")) == "1" and distutils.is_master():
+            import torch.profiler as _tp
+
+            _prof_dir = os.environ.get("EQV3_PROF_DIR", "./eqv3_prof")
+            _pw = int(os.environ.get("EQV3_PROF_WAIT", "5"))
+            _pwu = int(os.environ.get("EQV3_PROF_WARMUP", "5"))
+            _pa = int(os.environ.get("EQV3_PROF_ACTIVE", "20"))
+
+            def _on_ready(p):
+                _tp.tensorboard_trace_handler(_prof_dir)(p)
+                logging.info(
+                    "[PROF] top kernels:\n"
+                    + p.key_averages().table(sort_by="cuda_time_total", row_limit=25)
+                )
+
+            _prof = _tp.profile(
+                activities=[_tp.ProfilerActivity.CPU, _tp.ProfilerActivity.CUDA],
+                schedule=_tp.schedule(wait=_pw, warmup=_pwu, active=_pa, repeat=1),
+                on_trace_ready=_on_ready,
+                record_shapes=True,
+            )
+            _prof.start()
+
+        # 峰值显存探针（env 开关，默认 no-op；镜像 esen 的 ESEN_MEM_PROBE）。每 print_every 打印
+        # 累计 max_allocated（真实张量峰值）与 max_reserved（含 cudagraph 静态池/碎片），用于分辨
+        # budget/compile 下显存膨胀是真张量还是 reserved。仅 master rank。
+        _mprobe = os.environ.get("EQV3_MEM_PROBE", os.environ.get("ESEN_MEM_PROBE", "0")) == "1"
 
         for epoch_int in range(
             start_epoch, self.config["optim"]["max_epochs"]
@@ -534,6 +595,11 @@ class EquiformerV3DeNSTrainer(EquiformerV2ForcesTrainer):
                             disable_eval_tqdm=disable_eval_tqdm,
                         )
 
+                        # release the val-phase activation blocks the caching
+                        # allocator is holding, so reserved footprint drops back
+                        # to the train level instead of staying at the val peak.
+                        torch.cuda.empty_cache()
+
                     if self.config["task"].get("eval_relaxations", False):
                         if "relax_dataset" not in self.config["task"]:
                             logging.warning(
@@ -551,10 +617,24 @@ class EquiformerV3DeNSTrainer(EquiformerV2ForcesTrainer):
                     if self.step % self.grad_accumulation_steps == 0:
                         self.scheduler.step()
 
-            # torch.cuda.empty_cache()
+                if _prof is not None:
+                    _prof.step()
+
+                if (
+                    _mprobe
+                    and self.step % self.config["cmd"]["print_every"] == 0
+                    and distutils.is_master()
+                ):
+                    logging.info(
+                        f"[MEM] max_allocated={torch.cuda.max_memory_allocated() / 1e9:.2f}GB "
+                        f"max_reserved={torch.cuda.max_memory_reserved() / 1e9:.2f}GB"
+                    )
 
             if checkpoint_every == -1:
                 self.save(checkpoint_file="checkpoint.pt", training_state=True)
+
+        if _prof is not None:
+            _prof.stop()
 
         if hasattr(self.train_dataset, 'close_db'):
             self.train_dataset.close_db()

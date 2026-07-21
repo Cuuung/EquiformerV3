@@ -42,6 +42,12 @@ docker-build.log
 /checkpoints/
 *.ckpt
 
+# compile_dev gate baselines: untracked dev artifacts recorded against
+# pre-refactor code (see compile_dev/README.md for how to regenerate).
+# Scoped to compile_dev/ so the tracked Jd.pt / reference .pt assets above
+# are unaffected.
+compile_dev/*.pt
+
 # ─────────────────── Training run outputs ──────────────────
 /outputs/
 /logs/
@@ -60,3 +66,7 @@ metadata*.npz
 
 # Claude Code scratch output (redirect target for cluster-node ENOSPC workaround)
 .claude_tmp_out.txt
+
+# profiler traces (EQV3_PROF / ESEN_PROF output) — multi-GB, dev artifacts only
+docs/train_speed_analysis/**/*.trace.json
+docs/train_speed_analysis/**/*.png

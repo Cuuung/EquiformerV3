@@ -6,7 +6,7 @@ from e3nn import o3
 from e3nn.o3 import FromS2Grid, ToS2Grid
 
 from .wigner import wigner_D
-from .edge_rot_mat import _ROTATION_MASK_THRESHOLD
+from .edge_rot_mat import _ROTATION_MASK_THRESHOLD, eulers_to_wigner
 
 
 class CoefficientMappingModule(torch.nn.Module):
@@ -354,6 +354,33 @@ class SO3Rotation(torch.nn.Module):
         self.wigner = wigner            #.detach()
         self.wigner_inv = wigner_inv    #.detach()
 
+    def set_wigner_from_eulers(self, eulers):
+        """Build Wigner-D matrices from Euler angles (UMA/esen Euler path).
+
+        make_fx-friendly replacement for set_wigner: no e3nn, no data-dependent
+        rot_clip boolean-mask. Gradient stability comes from Safeacos/Safeatan2
+        in init_edge_rot_euler_angles.
+
+        Args:
+            eulers: tuple (alpha, beta, gamma) from init_edge_rot_euler_angles,
+                    each shape (num_edges,).
+        """
+        wigner = eulers_to_wigner(eulers, 0, self.lmax)
+        wigner = torch.einsum('mi, nij -> nmj', self.wigner_index_to_m_array, wigner)
+        if torch.is_autocast_enabled():
+            wigner = wigner.to(torch.float16)
+        wigner_inv = torch.transpose(wigner, 1, 2).contiguous()
+        wigner_inv = wigner_inv * self.wigner_inv_rescale
+        if torch.is_autocast_enabled():
+            wigner_inv = wigner_inv.to(torch.float16)
+        # Mirror the old set_wigner detach policy:
+        # use_rotation_mask=True  => gradient method  => keep grad
+        # use_rotation_mask=False => direct prediction => detach (no grad through rotation)
+        if not self.use_rotation_mask:
+            wigner = wigner.detach()
+            wigner_inv = wigner_inv.detach()
+        self.wigner = wigner
+        self.wigner_inv = wigner_inv
 
     # Rotate the embedding
     def rotate(self, inputs):

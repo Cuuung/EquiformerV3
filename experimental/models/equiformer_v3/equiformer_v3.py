@@ -1,3 +1,4 @@
+import contextlib
 import math
 import torch
 
@@ -5,7 +6,7 @@ from fairchem.core.common.registry import registry
 from fairchem.core.common.utils import conditional_grad
 from fairchem.core.models.base import GraphModelMixin
 
-from .edge_rot_mat import init_edge_rot_mat
+from .edge_rot_mat import init_edge_rot_euler_angles
 from .envelope import PolynomialEnvelope
 from .so3 import (
     SO3Rotation,
@@ -179,6 +180,12 @@ class EquiformerV3_OC(torch.nn.Module, GraphModelMixin):
         avg_degree=_AVG_DEGREE,
 
         enforce_max_neighbors_strictly=True,
+
+        enable_compile: bool = False,
+        compile_dynamic: bool = False,
+        # bf16 混合精度（DPA4 式，roadmap §7）：只对交互块做 bf16 autocast，几何/归一化
+        # 保持 fp32。与 trainer 级 optim.amp(fp16+GradScaler) 互斥，勿同时开。
+        use_amp: bool = False,
     ):
         super().__init__()
 
@@ -384,17 +391,23 @@ class EquiformerV3_OC(torch.nn.Module, GraphModelMixin):
                 
         self.apply(self._init_weights)
 
+        self.enable_compile = enable_compile
+        self.compile_dynamic = compile_dynamic
+        self._compiled_core = None
+        self._compiled_region = None
+        self.use_amp = use_amp
+
 
     def _forward_edge(
         self, 
         edge_distance, 
         edge_distance_vec
     ):
-        # Compute 3x3 rotation matrix per edge
-        edge_rot_mat = self._init_edge_rot_mat(edge_distance_vec)
+        # Compute Euler angles per edge (UMA Euler path, make_fx-friendly)
+        eulers = self._init_edge_rot_mat(edge_distance_vec)
 
-        # Compute Wigner-D matrices
-        self.so3_rotation.set_wigner(edge_rot_mat)
+        # Compute Wigner-D matrices from Euler angles
+        self.so3_rotation.set_wigner_from_eulers(eulers)
 
         # Envelope function
         edge_envelope_weight = self.envelope_func(edge_distance) if self.envelope_func is not None else None
@@ -412,7 +425,7 @@ class EquiformerV3_OC(torch.nn.Module, GraphModelMixin):
         edge_index, 
         edge_envelope_weight
     ):
-        num_atoms = len(atomic_numbers)
+        num_atoms = atomic_numbers.shape[0]
                 
         # Initialize node embedding
         x = torch.zeros(
@@ -451,39 +464,88 @@ class EquiformerV3_OC(torch.nn.Module, GraphModelMixin):
         edge_envelope_weight,
         batch
     ):
-        # Transformer blocks
-        for i in range(self.num_layers):
-            if self.gradient_checkpointing_block_list[i] == 0:
-                x = self.blocks[i](
-                    x, 
-                    source_atomic_numbers, 
-                    target_atomic_numbers, 
-                    edge_distance, 
-                    edge_index,
-                    edge_envelope_weight,
-                    batch,     # for GraphDropPath
-                )
-            elif self.gradient_checkpointing_block_list[i] == 1:
-                x = torch.utils.checkpoint.checkpoint(
-                    self.blocks[i],
-                    x,                  
-                    source_atomic_numbers,
-                    target_atomic_numbers,
-                    edge_distance,
-                    edge_index,
-                    edge_envelope_weight,
-                    batch,     # for GraphDropPath
-                    use_reentrant=False
-                )
-            else:
-                raise ValueError
-            
+        # bf16 混合精度（DPA4 式，roadmap §7）：autocast 只包交互块；几何/边特征已在
+        # fp32 算好，留在区外。仅训练+CUDA+开关时生效。末层 norm 自带
+        # @torch.cuda.amp.autocast(enabled=False) fp32 守卫，故放区外即可。
+        _amp = self.use_amp and self.training and x.is_cuda
+        # 注意：torch.autocast(enabled=False) 会主动关闭外层 optim.amp 的 fp16
+        # autocast，导致块内 so3.rotate 的 bmm(wigner=half, inputs=float) 失配。
+        # 故 _amp=False 时不进任何 autocast，让外层 fp16 混合精度透传；只有 bf16
+        # 才真正包一层 bf16 autocast。
+        blocks_ctx = (
+            torch.autocast("cuda", dtype=torch.bfloat16)
+            if _amp else contextlib.nullcontext()
+        )
+        with blocks_ctx:
+            # Transformer blocks
+            for i in range(self.num_layers):
+                if self.gradient_checkpointing_block_list[i] == 0:
+                    x = self.blocks[i](
+                        x,
+                        source_atomic_numbers,
+                        target_atomic_numbers,
+                        edge_distance,
+                        edge_index,
+                        edge_envelope_weight,
+                        batch,     # for GraphDropPath
+                    )
+                elif self.gradient_checkpointing_block_list[i] == 1:
+                    x = torch.utils.checkpoint.checkpoint(
+                        self.blocks[i],
+                        x,
+                        source_atomic_numbers,
+                        target_atomic_numbers,
+                        edge_distance,
+                        edge_index,
+                        edge_envelope_weight,
+                        batch,     # for GraphDropPath
+                        use_reentrant=False
+                    )
+                else:
+                    raise ValueError
+
+        # bf16 下块输出是 bf16，转回 fp32 让 norm 及下游能量/力都在 fp32
+        if _amp:
+            x = x.float()
         # Final layer norm
         x = self.norm(x)
         x_scalar = x.narrow(1, 0, 1)
         x_scalar = x_scalar.view(x_scalar.shape[0], self.num_channels)
         return x_scalar, x
-        
+
+
+    def core_compute(
+        self,
+        atomic_numbers,
+        edge_distance,
+        edge_distance_vec,
+        edge_index,
+        batch,
+    ):
+        """Pure tensor-in / tensor-out compute body.
+
+        Takes RAW (pre-expansion) edge_distance plus edge_distance_vec and
+        returns node embeddings. The pos-dependent rotation/Wigner-D setup
+        (_forward_edge) lives INSIDE this method so the whole pos->Wigner->
+        embedding->blocks chain is captured when this body is traced/compiled
+        (Task 4 conservative force). Energy aggregation and force/stress heads
+        remain in the callers.
+        """
+        edge_distance, edge_envelope_weight = self._forward_edge(edge_distance, edge_distance_vec)
+        source_atomic_numbers = atomic_numbers[edge_index[0]]
+        target_atomic_numbers = atomic_numbers[edge_index[1]]
+        x = self._forward_embedding(atomic_numbers, edge_distance, edge_index, edge_envelope_weight)
+        x_scalar, x = self._forward_blocks(
+            x,
+            source_atomic_numbers,
+            target_atomic_numbers,
+            edge_distance,
+            edge_index,
+            edge_envelope_weight,
+            batch,
+        )
+        return x_scalar, x, edge_distance, edge_envelope_weight
+
 
     def _forward_direct(self, data):
         self.batch_size = len(data.natoms)
@@ -507,16 +569,18 @@ class EquiformerV3_OC(torch.nn.Module, GraphModelMixin):
         source_atomic_numbers = atomic_numbers[edge_index[0]]
         target_atomic_numbers = atomic_numbers[edge_index[1]]
 
-        edge_distance, edge_envelope_weight = self._forward_edge(edge_distance, edge_distance_vec)
-        x = self._forward_embedding(atomic_numbers, edge_distance, edge_index, edge_envelope_weight)
-        x_scalar, x = self._forward_blocks(
-            x,
-            source_atomic_numbers, 
-            target_atomic_numbers, 
-            edge_distance, 
+        compute = self.core_compute
+        if self.enable_compile:
+            if self._compiled_core is None:
+                from fairchem.core.common.compile_utils import plain_compile
+                self._compiled_core = plain_compile(self.core_compute, dynamic=self.compile_dynamic)
+            compute = self._compiled_core
+        x_scalar, x, edge_distance, edge_envelope_weight = compute(
+            atomic_numbers,
+            edge_distance,
+            edge_distance_vec,
             edge_index,
-            edge_envelope_weight,
-            data.batch
+            data.batch,
         )
 
         outputs = {}
@@ -541,7 +605,7 @@ class EquiformerV3_OC(torch.nn.Module, GraphModelMixin):
             forces = forces.narrow(1, 1, 3)
             forces = forces.view(-1, 3)
             outputs['forces'] = forces
-        
+
         # Stress Prediction
         if self.regress_stress:
             stress = self.stress_block(
@@ -550,16 +614,22 @@ class EquiformerV3_OC(torch.nn.Module, GraphModelMixin):
                 batch=data.batch
             )
             outputs['stress'] = stress
-                
+
         return outputs
-    
+
 
     @conditional_grad(torch.enable_grad())
     def _forward_gradient(self, data):
         """
-            1.  We have additional `@conditional_grad` as the decorator since the decorator might not be compatible with 
+            1.  We have additional `@conditional_grad` as the decorator since the decorator might not be compatible with
                 `torch.compile()` in direct methods.
         """
+        # 仅训练态走保守力编译区（该区以 create_graph=True 编译整段双反向，供外层 param 反向用）。
+        # eval 无外层 backward，改走下方 eager 路径（create_graph=self.training=False）—— 不建双反向图、
+        # 不触发编译，消除首次 eval 的显存尖峰。对齐 DPA4 should_use_compile 的 self.training 门控。
+        if self.enable_compile and self.training:
+            return self._conservative_compiled_forward(data)
+
         self.batch_size = len(data.natoms)
         self.dtype = data.pos.dtype
         self.device = data.pos.device
@@ -608,19 +678,13 @@ class EquiformerV3_OC(torch.nn.Module, GraphModelMixin):
         )
 
         atomic_numbers = data.atomic_numbers.long()
-        source_atomic_numbers = atomic_numbers[edge_index[0]]
-        target_atomic_numbers = atomic_numbers[edge_index[1]]
 
-        edge_distance, edge_envelope_weight = self._forward_edge(edge_distance, edge_distance_vec)
-        x = self._forward_embedding(atomic_numbers, edge_distance, edge_index, edge_envelope_weight)
-        x_scalar, x = self._forward_blocks(
-            x,
-            source_atomic_numbers, 
-            target_atomic_numbers, 
-            edge_distance, 
+        x_scalar, x, _, _ = self.core_compute(
+            atomic_numbers,
+            edge_distance,
+            edge_distance_vec,
             edge_index,
-            edge_envelope_weight,
-            data.batch
+            data.batch,
         )
 
         outputs = {}
@@ -658,7 +722,141 @@ class EquiformerV3_OC(torch.nn.Module, GraphModelMixin):
             outputs['forces'] = forces
 
         return outputs
-    
+
+
+    def _conservative_compiled_forward(self, data):
+        """make_fx-compiled conservative force/stress (Task 4, base / non-DeNS).
+
+        Builds a pure tensor-in/out ``core_fn`` over the differentiated leaves
+        (pos, and displacement when regress_stress) plus the per-batch graph
+        tensors, then runs it through the shared CompiledForceRegion (make_fx ->
+        strip_detach -> rebuild -> inductor, per-shape cached). The WHOLE
+        pos -> edv -> Wigner -> energy -> autograd.grad double-backward lives
+        inside the traced region. Neighbor-list construction (generate_graph)
+        stays eager; it only supplies the (non-differentiated) connectivity
+        edge_index / cell_offsets.
+
+        Stale-bake guard: EVERY per-batch tensor (atomic_numbers, edge_index,
+        cell_offsets, cell, batch) is an explicit core_fn input — NOT a closure
+        capture — so a same-shape batch reuses the cached graph with fresh data.
+        Only live module refs (self.core_compute, self.energy_block, whose params
+        update in place) stay in the closure. DeNS twin lives in
+        equiformer_v3_dens.py (core_compute there takes a force_embedding arg).
+        """
+        from fairchem.core.common.compile_utils import (
+            CompiledForceRegion,
+            make_prime_graph_example,
+        )
+
+        self.batch_size = len(data.natoms)
+        self.dtype = data.pos.dtype
+        self.device = data.pos.device
+
+        # Eager (non-differentiated) graph construction on the UN-perturbed pos.
+        # displacement is identically zero at the perturbation point, so the
+        # connectivity here matches what the perturbed pos would yield; the
+        # region recomputes edge geometry from pos so forces/stress are exact.
+        (
+            edge_index,
+            edge_distance,
+            edge_distance_vec,
+            cell_offsets,
+            _,
+            neighbors,
+        ) = self.generate_graph(
+            data,
+            enforce_max_neighbors_strictly=self.enforce_max_neighbors_strictly,
+            use_pbc_single=self.use_pbc_single,
+        )
+
+        energy_block = self.energy_block
+        avg_num_nodes = self.avg_num_nodes
+
+        def _energy(pos_p, cell_p, an, ei, co, batch, n_sys):
+            # symbolic-safe forms (identical numerics for dynamic=False, required
+            # for dynamic=True): index_select instead of advanced indexing (the
+            # latter silently truncates the 2nd-order grad under symbolic trace),
+            # and reshape co off ei.shape[1] so the edge dim stays symbolic.
+            co = co.reshape(ei.shape[1], -1)
+            src, dst = ei[0], ei[1]
+            cell_e = cell_p.index_select(0, batch.index_select(0, src))
+            shifts = torch.einsum("ej,ejk->ek", co, cell_e)
+            edv = pos_p.index_select(0, src) - pos_p.index_select(0, dst) + shifts
+            ed = torch.linalg.norm(edv, dim=-1)
+            x_scalar, _x, _, _ = self.core_compute(an, ed, edv, ei, batch)
+            node_e = energy_block(x_scalar).view(-1)
+            energy = torch.zeros(n_sys, device=node_e.device, dtype=node_e.dtype)
+            energy.index_add_(0, batch, node_e)
+            energy = energy / avg_num_nodes
+            return energy
+
+        def core_fn_stress(pos, disp, an, ei, co, cell, batch):
+            sym = 0.5 * (disp + disp.transpose(-1, -2))
+            pos_p = pos + torch.bmm(
+                pos.unsqueeze(-2), torch.index_select(sym, 0, batch)
+            ).squeeze(-2)
+            cell_p = cell + torch.bmm(cell, sym)
+            energy = _energy(pos_p, cell_p, an, ei, co, batch, cell.shape[0])
+            grads = torch.autograd.grad([energy.sum()], [pos, disp], create_graph=True)
+            forces = torch.neg(grads[0])
+            virial = grads[1].view(-1, 3, 3)
+            volume = torch.det(cell).abs().unsqueeze(-1)
+            stress = (virial / volume.view(-1, 1, 1)).view(-1, 9)
+            return energy, forces, stress
+
+        def core_fn_force(pos, an, ei, co, cell, batch):
+            energy = _energy(pos, cell, an, ei, co, batch, cell.shape[0])
+            forces = torch.neg(
+                torch.autograd.grad(energy.sum(), pos, create_graph=True)[0]
+            )
+            return energy, forces
+
+        if self._compiled_region is None:
+            self._compiled_region = CompiledForceRegion(
+                dynamic=self.compile_dynamic, optimize_ddp=False
+            )
+
+        dtype = data.pos.dtype
+        an = data.atomic_numbers.long()
+        ei = edge_index
+        co = cell_offsets.to(dtype)
+        cell = data.cell.to(dtype)
+        batch = data.batch
+        # Differentiate a FRESH leaf: any prior autograd history on data.pos must
+        # not leak into the traced region (a 2nd backward would hit freed saved
+        # tensors).
+        pos = data.pos.detach().requires_grad_(True)
+
+        dyn = self.compile_dynamic
+        outputs = {}
+        if self.regress_stress and self.regress_forces:
+            disp = torch.zeros(
+                (cell.shape[0], 3, 3), device=pos.device, dtype=dtype
+            ).requires_grad_(True)
+            energy, forces, stress = self._compiled_region(
+                core_fn_stress,
+                (pos, disp, an, ei, co, cell, batch),
+                trace_example=make_prime_graph_example(pos.device, dtype, stress=True)
+                if dyn else None,
+                dynamic_dims=[(pos, [0]), (disp, [0]), (an, [0]), (ei, [1]),
+                              (co, [0]), (cell, [0]), (batch, [0])] if dyn else None,
+            )
+            outputs['energy'] = energy
+            outputs['forces'] = forces
+            outputs['stress'] = stress
+        elif self.regress_forces:
+            energy, forces = self._compiled_region(
+                core_fn_force,
+                (pos, an, ei, co, cell, batch),
+                trace_example=make_prime_graph_example(pos.device, dtype, stress=False)
+                if dyn else None,
+                dynamic_dims=[(pos, [0]), (an, [0]), (ei, [1]), (co, [0]),
+                              (cell, [0]), (batch, [0])] if dyn else None,
+            )
+            outputs['energy'] = energy
+            outputs['forces'] = forces
+        return outputs
+
 
     def forward(self, data):
         if self.direct_prediction:
@@ -668,9 +866,9 @@ class EquiformerV3_OC(torch.nn.Module, GraphModelMixin):
         return outputs
 
 
-    # Initialize the edge rotation matrics
+    # Compute Euler angles for each edge (UMA/esen Euler path, make_fx-friendly)
     def _init_edge_rot_mat(self, edge_distance_vec):
-        return init_edge_rot_mat(edge_distance_vec, use_rotation_mask=(not self.direct_prediction))
+        return init_edge_rot_euler_angles(edge_distance_vec)
 
 
     @property
