@@ -160,6 +160,12 @@ class EquiformerV3DeNS_OC(EquiformerV3_OC):
         enable_compile: bool = False,
         compile_dynamic: bool = False,
         use_amp: bool = False,
+
+        # ---- DPA4 ablation switches (forwarded to the parent; defaults = pre-change) ---------
+        envelope_type: str = 'equiformerv3_c2',
+        envelope_exponent: int = 5,
+        attn_softmax_type: str = 'equiformerv3',
+        focus_compete_groups: int = 0,
     ):
         super().__init__(
             use_pbc,
@@ -223,6 +229,12 @@ class EquiformerV3DeNS_OC(EquiformerV3_OC):
             enable_compile,
             compile_dynamic,
             use_amp,
+            # Passed BY KEYWORD -- everything above is positional, so any future insertion in
+            # the parent signature must also go at its end (see the note there).
+            envelope_type=envelope_type,
+            envelope_exponent=envelope_exponent,
+            attn_softmax_type=attn_softmax_type,
+            focus_compete_groups=focus_compete_groups,
         )
 
         # Force encoding

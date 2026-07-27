@@ -101,7 +101,10 @@ class EquivariantGraphAttention(torch.nn.Module):
         alpha_drop=0.0,
         attn_mask_rate=0.0,
         attn_weights_drop=0.0,
-        value_drop=0.0
+        value_drop=0.0,
+        # ---- DPA4 ablation switches (both default to the pre-change behaviour) -------------
+        attn_softmax_type='equiformerv3',   # D1: 'dpa4_envelope_gated' to swap the normalisation
+        focus_compete_groups=0              # D2: >1 enables cross-focus competition
     ):
         super().__init__()
 
@@ -209,11 +212,29 @@ class EquivariantGraphAttention(torch.nn.Module):
         self.alpha_dot = torch.nn.Parameter(torch.randn(self.num_heads, self.attn_alpha_channels))
         std = 1.0 / math.sqrt(self.attn_alpha_channels)
         torch.nn.init.uniform_(self.alpha_dot, -std, std)
-        self.attn_softmax = GraphSoftmax(
-            eps=self.eps,
-            exp_dropout=attn_mask_rate, 
-            softcap=self.softcap
-        )
+        # D1 -- attention-weight normalisation. 'equiformerv3' is the pre-change path and is
+        # bit-identical to before. 'dpa4_envelope_gated' swaps in the DPA4 formula, which folds
+        # w^2 into numerator AND denominator itself -- see the `folds_envelope` guard in forward().
+        self.attn_softmax_type = attn_softmax_type
+        if self.attn_softmax_type == 'equiformerv3':
+            self.attn_softmax = GraphSoftmax(
+                eps=self.eps,
+                exp_dropout=attn_mask_rate,
+                softcap=self.softcap
+            )
+        elif self.attn_softmax_type == 'dpa4_envelope_gated':
+            from .dpa4_ops import EnvelopeGatedGraphSoftmax
+            self.attn_softmax = EnvelopeGatedGraphSoftmax(
+                num_heads=self.num_heads,
+                eps=self.eps,
+                softcap=self.softcap,
+                exp_dropout=attn_mask_rate     # raises if non-zero: no DPA4 counterpart
+            )
+        else:
+            raise ValueError(
+                "unknown attn_softmax_type={!r}; expected 'equiformerv3' or "
+                "'dpa4_envelope_gated'".format(self.attn_softmax_type)
+            )
         self.attn_weights_dropout = torch.nn.Dropout(attn_weights_drop) if attn_weights_drop != 0.0 else torch.nn.Identity()
         
         # S2/gate activation
@@ -241,6 +262,29 @@ class EquivariantGraphAttention(torch.nn.Module):
             self.so2_linear_2.fc_m0.weight.data[0:temp, :].mul_(1.0 / math.sqrt(2.0))
             
         self.proj = SO3Linear(self.num_heads * self.attn_value_channels, self.num_out_channels, lmax=self.lmax)
+
+        # D2 -- DPA4 cross-focus competition. The focus axis is a GROUPING of the head axis (in
+        # DPA4 focus also sits above head and partitions the channel axis, so2.py:1334):
+        # message [E, D, H*Cv] -> view [E, D, F, (H*Cv)/F], per-edge softmax across the F groups.
+        # focus_compete_groups in {0, 1} keeps the module absent -> zero new parameters.
+        self.focus_compete_groups = int(focus_compete_groups)
+        self.focus_compete = None
+        self._focus_channels = None
+        if self.focus_compete_groups > 1:
+            if self.num_heads % self.focus_compete_groups != 0:
+                raise ValueError(
+                    "focus_compete_groups={} must divide num_heads={} (focus is a grouping of "
+                    "the head axis; otherwise the channel count changes and the ablation stops "
+                    "being single-factor).".format(self.focus_compete_groups, self.num_heads)
+                )
+            from .dpa4_ops import CrossFocusCompetition
+            self._focus_channels = (
+                self.num_heads * self.attn_value_channels
+            ) // self.focus_compete_groups
+            self.focus_compete = CrossFocusCompetition(
+                n_focus=self.focus_compete_groups,
+                focus_dim=self._focus_channels
+            )
 
 
     def forward(
@@ -312,6 +356,24 @@ class EquivariantGraphAttention(torch.nn.Module):
 
         x_message = self.so2_linear_2(x_message)
 
+        # D2 -- DPA4 cross-focus competition. Position matches DPA4 so2.py Step 6: AFTER the
+        # non-linearity / SO(2) mixing, BEFORE rotating back to the global frame and aggregating.
+        # RECORDED DEVIATION from DPA4: DPA4 takes the gate source from the SO(2) mixing layer's
+        # INPUT (so2.py:1334, Step 4); we take it from the gated tensor ITSELF (its l=0 scalars),
+        # because our channel width changes between so2_linear_1 and so2_linear_2. The gate is
+        # still computed from l=0 scalars only -> equivariance is unaffected. mlip-forge made the
+        # same choice, so the two sides' results stay comparable.
+        if self.focus_compete is not None:
+            F_ = self.focus_compete_groups
+            e, d, _ = x_message.shape
+            x_message = x_message.view(e, d, F_, self._focus_channels)
+            x_message = self.focus_compete(
+                x_message,
+                gate_src=x_message[:, 0, :, :],   # l=0 scalars, (E, F, Cf)
+                focus_dim_index=2
+            )
+            x_message = x_message.reshape(e, d, F_ * self._focus_channels)
+
         # Graph attention
         x_alpha = x_alpha.view(-1, self.num_heads, self.attn_alpha_channels)
         x_alpha = self.alpha_norm(x_alpha)
@@ -320,7 +382,15 @@ class EquivariantGraphAttention(torch.nn.Module):
         alpha = torch.einsum('bik, ik -> bi', x_alpha, self.alpha_dot)
         #alpha = torch_geometric.utils.softmax(alpha, edge_index[1], num_nodes=num_nodes)
         alpha = self.attn_softmax(alpha, edge_index[1], num_nodes=num_nodes, exp_rescale=edge_envelope_weight)
-        if edge_envelope_weight is not None:
+        # ================== DO NOT REMOVE THE `folds_envelope` GUARD ==========================
+        # GraphSoftmax folds ONE envelope factor into numerator+denominator; this line supplies
+        # the SECOND factor of the numerator, giving EquiformerV3's  alpha = w^2 exp / sum w exp.
+        # The DPA4 softmax folds w^2 in ITSELF, so multiplying again here would give alpha ~ w^3
+        # -- neither formula, and with NO visible symptom (still equivariant, still normalised,
+        # loss still descends, run still finishes, kappa still comes out). The ablation row would
+        # be pure noise and nobody would notice. `folds_envelope` is the contract that prevents it;
+        # test_dpa4_switches.py asserts BOTH branches and greps this file for the guard itself.
+        if edge_envelope_weight is not None and not getattr(self.attn_softmax, 'folds_envelope', False):
             alpha = alpha * edge_envelope_weight
         alpha = alpha.view(alpha.shape[0], 1, self.num_heads, 1)
         alpha = self.attn_weights_dropout(alpha)
@@ -652,7 +722,10 @@ class TransBlockV3(torch.nn.Module):
         value_drop=0.0,
         drop_path_rate=0.0,
         proj_drop=0.0,
-        ffn_drop=0.0
+        ffn_drop=0.0,
+        # ---- DPA4 ablation switches, forwarded to the GA (defaults = pre-change behaviour) ---
+        attn_softmax_type='equiformerv3',
+        focus_compete_groups=0
     ):
         super().__init__()
 
@@ -681,7 +754,9 @@ class TransBlockV3(torch.nn.Module):
             alpha_drop=alpha_drop,
             attn_mask_rate=attn_mask_rate,
             attn_weights_drop=attn_weights_drop,
-            value_drop=value_drop
+            value_drop=value_drop,
+            attn_softmax_type=attn_softmax_type,
+            focus_compete_groups=focus_compete_groups
         )
 
         if 'rms_norm' in norm_type:

@@ -7,7 +7,7 @@ from fairchem.core.common.utils import conditional_grad
 from fairchem.core.models.base import GraphModelMixin
 
 from .edge_rot_mat import init_edge_rot_euler_angles
-from .envelope import PolynomialEnvelope
+from .envelope import PolynomialEnvelope, build_envelope
 from .so3 import (
     SO3Rotation,
     SO3Linear
@@ -186,6 +186,18 @@ class EquiformerV3_OC(torch.nn.Module, GraphModelMixin):
         # bf16 混合精度（DPA4 式，roadmap §7）：只对交互块做 bf16 autocast，几何/归一化
         # 保持 fp32。与 trainer 级 optim.amp(fp16+GradScaler) 互斥，勿同时开。
         use_amp: bool = False,
+
+        # ---- DPA4 ablation switches -----------------------------------------------------------
+        # Appended at the END of the signature ON PURPOSE: EquiformerV3DeNS_OC calls super()
+        # POSITIONALLY, so inserting anywhere earlier would silently shift every later argument.
+        # ALL THREE DEFAULT TO THE PRE-CHANGE BEHAVIOUR -- with the defaults the forward pass is
+        # bit-identical and the state_dict key set is unchanged (pinned by test_dpa4_switches.py).
+        # See experimental/models/equiformer_v3/dpa4_ops/__init__.py for the full contract.
+        envelope_type: str = 'equiformerv3_c2',   # D4: 'dpa4_c3' -> C3-continuous cutoff envelope
+        envelope_exponent: int = 5,               # envelope polynomial p. KEEP 5 -- changing it is
+                                                  #   a SECOND factor, not part of D4.
+        attn_softmax_type: str = 'equiformerv3',  # D1: 'dpa4_envelope_gated'
+        focus_compete_groups: int = 0,            # D2: 2/4/8, must divide num_heads
     ):
         super().__init__()
 
@@ -220,6 +232,10 @@ class EquiformerV3_OC(torch.nn.Module, GraphModelMixin):
         self.edge_channels = edge_channels
         self.use_atom_edge_embedding = use_atom_edge_embedding
         self.use_envelope = use_envelope
+        self.envelope_type = envelope_type
+        self.envelope_exponent = envelope_exponent
+        self.attn_softmax_type = attn_softmax_type
+        self.focus_compete_groups = focus_compete_groups
 
         self.attn_activation = attn_activation
         self.use_attn_renorm = use_attn_renorm
@@ -268,9 +284,14 @@ class EquiformerV3_OC(torch.nn.Module, GraphModelMixin):
         self.edge_channels_list = [edge_input_channels] + [self.edge_channels] * 2
 
         # Envelope function
-        self.envelope_func = PolynomialEnvelope(
+        # SINGLE envelope construction site in the whole training path. Its result is threaded
+        # to every consumer (input_block / each block's GA / output_block's GA) as
+        # `edge_envelope_weight`, so two different cutoffs can never coexist in one forward pass.
+        # test_dpa4_switches.py pins that invariant.
+        self.envelope_func = build_envelope(
+            envelope_type=self.envelope_type,
             cutoff=self.cutoff,
-            exponent=5
+            exponent=self.envelope_exponent
         ) if self.use_envelope else None
 
         # Computing Wigner-D matrices
@@ -328,7 +349,13 @@ class EquiformerV3_OC(torch.nn.Module, GraphModelMixin):
                 value_drop=self.value_drop,
                 drop_path_rate=self.drop_path_rate,
                 proj_drop=self.proj_drop,
-                ffn_drop=self.ffn_drop
+                ffn_drop=self.ffn_drop,
+                # DPA4 switches apply to the TRANSFORMER BLOCKS ONLY -- deliberately NOT to
+                # force_block / dens_block / stress head. Those heads exist only in the direct
+                # stage and are discarded at grad-finetune, so keeping them on the baseline path
+                # makes the new parameter set IDENTICAL in both stages and fully transferable.
+                attn_softmax_type=self.attn_softmax_type,
+                focus_compete_groups=self.focus_compete_groups
             )
             block_class = TransBlockV3
             self.blocks.append(block_class(**block_config_dict))
@@ -920,6 +947,21 @@ class EquiformerV3_OC(torch.nn.Module, GraphModelMixin):
                     global_parameter_name = module_name + '.' + parameter_name
                     assert global_parameter_name in named_parameters_list
                     no_wd_list.append(global_parameter_name)
+
+        # ---- DPA4 ablation parameters (present ONLY when the switches are on) ----------------
+        # HybridMuon routes every ndim>=2 parameter to Muon. Two of the DPA4 parameters are 2-D
+        # only incidentally and must NOT be Newton-Schulz orthogonalized:
+        #   * z_bias_raw          (1, H)  -- a per-head scalar denominator bias, not a linear map
+        #   * ...norm.adam_scale  (F, Cf) -- an RMSNorm gain (DPA4's `adam_` prefix literally
+        #                                    means "Adam, no weight decay")
+        # Listing them here routes them to the AdamW/no-decay group, matching DPA4's own intent.
+        # `adamw_focus_compete_w` (Cf, F) IS a genuine linear map and is deliberately LEFT on Muon.
+        # When the switches are off none of these exist, so this loop adds nothing and the returned
+        # set is byte-identical to before.
+        for parameter_name, _ in self.named_parameters():
+            if parameter_name.endswith('z_bias_raw') or parameter_name.endswith('focus_compete_norm.adam_scale'):
+                no_wd_list.append(parameter_name)
+
         return set(no_wd_list)
 
 
