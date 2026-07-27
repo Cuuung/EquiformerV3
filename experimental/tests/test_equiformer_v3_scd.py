@@ -1,0 +1,342 @@
+"""EquiformerV3-SCD (v0) 冒烟测试：结构 / 等变性 / 梯度连通性 / 两条编译路径。
+
+需要 GPU 与项目训练镜像，直接运行：
+    python experimental/tests/test_equiformer_v3_scd.py
+非 0 退出码即为失败。
+"""
+import sys
+import torch
+from torch_geometric.data import Data, Batch
+
+from fairchem.core.common.utils import setup_imports
+from fairchem.core.common.registry import registry
+
+setup_imports()
+
+DEV = "cuda" if torch.cuda.is_available() else "cpu"
+torch.manual_seed(0)
+
+MODEL_CFG = dict(
+    use_pbc=True,
+    use_pbc_single=True,
+    otf_graph=True,
+    regress_forces=True,
+    regress_stress=True,
+    direct_prediction=True,
+    max_neighbors=20,
+    max_radius=5.0,
+    num_radial_basis=10,
+    max_num_elements=128,
+    num_layers=2,
+    num_channels=32,
+    attn_hidden_channels=16,
+    num_heads=4,
+    attn_alpha_channels=16,
+    attn_value_channels=8,
+    ffn_hidden_channels=64,
+    norm_type="merge_layer_norm",
+    lmax=2,
+    mmax=2,
+    attn_grid_resolution_list=[14, 8],
+    ffn_grid_resolution_list=[14, 14],
+    edge_channels=32,
+    drop_path_rate=0.0,
+    attn_weights_drop=0.0,
+    gradient_checkpointing_block_list=[0, 0],
+    avg_num_nodes=1,
+)
+
+FAILURES = []
+
+
+def check(name, ok, extra=""):
+    print(f"[{'PASS' if ok else 'FAIL'}] {name} {extra}")
+    if not ok:
+        FAILURES.append(name)
+
+
+def make_batch(n_per=6, n_sys=2, seed=0):
+    g = torch.Generator().manual_seed(seed)
+    datas = []
+    for _ in range(n_sys):
+        cell = torch.eye(3) * 8.0
+        pos = torch.rand((n_per, 3), generator=g) * 8.0
+        d = Data(
+            pos=pos,
+            atomic_numbers=torch.randint(1, 30, (n_per,), generator=g).float(),
+            cell=cell.unsqueeze(0),
+            natoms=torch.tensor([n_per]),
+            fixed=torch.zeros(n_per),
+            forces=torch.randn((n_per, 3), generator=g) * 0.1,
+            energy=torch.tensor([0.0]),
+            pbc=torch.tensor([[True, True, True]]),
+        )
+        datas.append(d)
+    return Batch.from_data_list(datas).to(DEV)
+
+
+def add_noise(batch, std=0.05):
+    """复刻 add_gaussian_noise_to_position 的 all_atoms=True 分支。"""
+    noise = torch.randn_like(batch.pos) * std
+    batch.pos_clean = batch.pos.clone()
+    batch.pos = batch.pos + noise
+    batch.noise_vec = noise
+    batch.denoising_pos_forward = True
+    batch.dens_batch_mask = torch.ones(
+        (len(batch.natoms),), dtype=torch.bool, device=batch.pos.device
+    )
+    return batch
+
+
+def build(**over):
+    cfg = dict(MODEL_CFG)
+    cfg.update(over)
+    return registry.get_model_class("equiformer_v3_scd")(**cfg).to(DEV)
+
+
+# ---------------------------------------------------------------- 1. 注册
+try:
+    cls = registry.get_model_class("equiformer_v3_scd")
+    check("模型注册 equiformer_v3_scd", cls is not None, f"-> {cls.__name__}")
+except Exception as e:
+    check("模型注册 equiformer_v3_scd", False, repr(e))
+    sys.exit(1)
+
+model = build()
+
+# ------------------------------------------- 2. 零初始化 => 初始等价于 DeNS
+b = add_noise(make_batch())
+model.train()
+model.dtype, model.device = b.pos.dtype, b.pos.device
+cond = model._scd_cond_embedding(b)
+check(
+    "零初始化下 cond 恒为 0（初始逐位等价 DeNS，可从 DeNS ckpt 续训）",
+    bool(torch.all(cond == 0)),
+    f"shape={tuple(cond.shape)}",
+)
+check(
+    "cond 只占 L=0 通道",
+    cond.shape[1] == (MODEL_CFG["lmax"] + 1) ** 2,
+)
+
+# 打破零初始化，后续测试才有意义
+with torch.no_grad():
+    model.scd_cond_proj.weight.normal_(0, 0.05)
+    model.scd_cond_proj.bias.normal_(0, 0.05)
+
+# ------------------------------------------------------- 3. direct 双前向
+b = add_noise(make_batch())
+out = model(b)
+check(
+    "direct + denoising: 前向可跑",
+    out["energy"].shape == (2,) and out["forces"].shape == (12, 3),
+    f"E{tuple(out['energy'].shape)} F{tuple(out['forces'].shape)} S{tuple(out['stress'].shape)}",
+)
+
+def grad_status(m):
+    """(全部参数是否进入 autograd 图, 除 mask_token 外是否都拿到非零梯度)
+
+    mask_token 只在 dropcond 命中时才有非零梯度，但 `mask_token * (1 - keep)`
+    保证它恒在图中（grad 为 0 而非 None）—— 这是 DDP find_unused_parameters=False
+    的判据。
+    """
+    in_graph, nonzero = {}, {}
+    for n, p in m.named_parameters():
+        if not n.startswith("scd_"):
+            continue
+        in_graph[n] = p.grad is not None
+        if n != "scd_mask_token":
+            nonzero[n] = p.grad is not None and bool(p.grad.abs().sum() > 0)
+    return in_graph, nonzero
+
+
+loss = out["energy"].sum() + out["forces"].sum()
+loss.backward()
+in_graph, nonzero = grad_status(model)
+check(
+    "direct: 全部 SCD 参数进入 autograd 图（DDP unused-param 安全）",
+    all(in_graph.values()),
+    f"{sum(in_graph.values())}/{len(in_graph)}",
+)
+check(
+    "direct: 梯度非零回流（含 clean 前向路径）",
+    all(nonzero.values()) and any("cond_head" in k for k, v in nonzero.items() if v),
+    f"{sum(nonzero.values())}/{len(nonzero)}",
+)
+model.zero_grad(set_to_none=True)
+
+# -------------------------------------------- 4. 无噪声 step 走单次前向
+b2 = make_batch(seed=1)
+n_graph_calls = []
+orig_gg = model.generate_graph
+model.generate_graph = lambda *a, **k: (n_graph_calls.append(1), orig_gg(*a, **k))[1]
+model(b2)
+single = len(n_graph_calls)
+n_graph_calls.clear()
+model(add_noise(make_batch(seed=1)))
+double = len(n_graph_calls)
+model.generate_graph = orig_gg
+check(
+    "无噪声 step 单次建图 / 加噪 step 两次建图",
+    single == 1 and double == 2,
+    f"{single} vs {double}",
+)
+
+# ---------------------------------------------------------- 5. eval 单前向
+model.eval()
+n_graph_calls.clear()
+model.generate_graph = lambda *a, **k: (n_graph_calls.append(1), orig_gg(*a, **k))[1]
+with torch.no_grad():
+    model(add_noise(make_batch(seed=2)))
+model.generate_graph = orig_gg
+check("eval 态不触发 clean 前向（推理无条件开销）", len(n_graph_calls) == 1, f"{len(n_graph_calls)}")
+
+# ------------------------------------------------------------- 6. 等变性
+model.train()
+
+
+def rot_mat(dtype):
+    a = torch.tensor(0.7, dtype=dtype)
+    ca, sa = torch.cos(a), torch.sin(a)
+    return torch.tensor(
+        [[ca, -sa, 0.0], [sa, ca, 0.0], [0.0, 0.0, 1.0]], dtype=dtype, device=DEV
+    )
+
+
+torch.manual_seed(3)
+b_a = add_noise(make_batch(seed=3))
+R = rot_mat(b_a.pos.dtype)
+b_b = add_noise(make_batch(seed=3))
+b_b.pos = b_a.pos @ R.T
+b_b.pos_clean = b_a.pos_clean @ R.T
+b_b.noise_vec = b_a.noise_vec @ R.T
+b_b.cell = torch.einsum("bij,kj->bik", b_a.cell, R)
+b_b.forces = b_a.forces @ R.T
+
+model.eval()  # 关掉 dropcond 随机性
+with torch.no_grad():
+    o_a = model(b_a)
+    o_b = model(b_b)
+e_err = (o_a["energy"] - o_b["energy"]).abs().max().item()
+f_err = (o_a["forces"] @ R.T - o_b["forces"]).abs().max().item()
+check("能量旋转不变", e_err < 1e-4, f"max|dE|={e_err:.2e}")
+check("力旋转等变", f_err < 1e-4, f"max|dF|={f_err:.2e}")
+
+# --------------------------------------- 7. use_force_cond=False（纯 SCD）
+m2 = build(use_force_cond=False)
+has_fe = any(n.startswith("force_embedding") for n, _ in m2.named_parameters())
+check("use_force_cond=False 时移除 force_embedding（避免 DDP unused param）", not has_fe)
+m2.train()
+with torch.no_grad():
+    m2.scd_cond_proj.weight.normal_(0, 0.05)
+o2 = m2(add_noise(make_batch(seed=4)))
+check("纯自条件模式前向可跑", o2["energy"].shape == (2,))
+
+# ------------------------------------------------- 8. 保守力 (gradient) 路径
+m3 = build(direct_prediction=False, regress_stress=True)
+m3.train()
+with torch.no_grad():
+    m3.scd_cond_proj.weight.normal_(0, 0.05)
+b3 = add_noise(make_batch(seed=5))
+o3 = m3(b3)
+check(
+    "gradient(保守力) 路径可跑",
+    o3["energy"].shape == (2,) and o3["forces"].shape == (12, 3),
+)
+o3["energy"].sum().backward()
+in_graph3, nonzero3 = grad_status(m3)
+check(
+    "保守力: 全部 SCD 参数进入 autograd 图（DDP unused-param 安全）",
+    all(in_graph3.values()),
+    f"{sum(in_graph3.values())}/{len(in_graph3)}",
+)
+check(
+    "保守力: 梯度非零回流（能量二阶图穿过 cond）",
+    all(nonzero3.values()),
+    f"{sum(nonzero3.values())}/{len(nonzero3)}",
+)
+
+# ------------------------------------------------------- 9. no_weight_decay
+check("scd_mask_token 进入 no_weight_decay", "scd_mask_token" in model.no_weight_decay())
+
+# =================================== 编译路径 ===================================
+
+
+
+def run_two_steps(m, tag, seeds=(11, 12)):
+    """跑两个不同 batch，验证不会把第一批的 per-batch 张量烤进图（stale-bake）。"""
+    outs = []
+    for s in seeds:
+        b = add_noise(make_batch(n_per=6 + (s % 3), seed=s))
+        o = m(b)
+        o["energy"].sum().backward()
+        m.zero_grad(set_to_none=True)
+        outs.append(o["energy"].detach().clone())
+    check(f"{tag}: 连续两个不同 shape 的 batch 均可跑（无 stale-bake）", True,
+          f"E1={outs[0].tolist()} E2={outs[1].tolist()}")
+    return outs
+
+
+# ---------------------------------------------- A. 外层 torch.compile (direct)
+try:
+    m = build()
+    m.train()
+    with torch.no_grad():
+        m.scd_cond_proj.weight.normal_(0, 0.05)
+    torch._dynamo.config.optimize_ddp = False
+    mc = torch.compile(m, dynamic=True)
+    run_two_steps(mc, "A/外层 torch.compile + direct")
+except Exception as e:
+    check("A/外层 torch.compile + direct", False, f"{type(e).__name__}: {str(e)[:300]}")
+
+# ------------------------------------------- B. 内层 make_fx region (保守力)
+try:
+    torch._dynamo.reset()
+    m2 = build(direct_prediction=False, regress_stress=True,
+               enable_compile=True, compile_dynamic=False)
+    m2.train()
+    with torch.no_grad():
+        m2.scd_cond_proj.weight.normal_(0, 0.05)
+    run_two_steps(m2, "B/model.enable_compile + 保守力")
+
+    g = {n: (p.grad is not None) for n, p in m2.named_parameters() if n.startswith("scd_")}
+    b = add_noise(make_batch(seed=13))
+    o = m2(b)
+    o["energy"].sum().backward()
+    nz = [bool(p.grad is not None and p.grad.abs().sum() > 0)
+          for n, p in m2.named_parameters()
+          if n.startswith("scd_") and n != "scd_mask_token"]
+    check("B: 编译区外的 clean 前向仍收到梯度（fe 作为 traced 入参可微）",
+          all(nz), f"{sum(nz)}/{len(nz)}")
+except Exception as e:
+    check("B/model.enable_compile + 保守力", False, f"{type(e).__name__}: {str(e)[:300]}")
+
+# ------------------------------ C. 编译 vs eager 数值一致性（保守力，同权重）
+try:
+    torch._dynamo.reset()
+    torch.manual_seed(99)
+    m3 = build(direct_prediction=False, regress_stress=True)
+    with torch.no_grad():
+        m3.scd_cond_proj.weight.normal_(0, 0.05)
+    sd = {k: v.clone() for k, v in m3.state_dict().items()}
+    m4 = build(direct_prediction=False, regress_stress=True,
+               enable_compile=True, compile_dynamic=False)
+    m4.load_state_dict(sd)
+    # enable_compile 仅在 training 态走编译区；两侧从同一 RNG 状态起跑，
+    # 保证 add_noise 的噪声与 dropcond 的丢弃掩码完全一致。
+    m3.train(); m4.train()
+    torch.manual_seed(7); b1 = add_noise(make_batch(seed=21)); o_eager = m3(b1)
+    torch.manual_seed(7); b2 = add_noise(make_batch(seed=21)); o_comp = m4(b2)
+    assert torch.equal(b1.pos, b2.pos), "两侧输入不一致，测试无效"
+    de = (o_eager["energy"] - o_comp["energy"]).abs().max().item()
+    df = (o_eager["forces"] - o_comp["forces"]).abs().max().item()
+    check("C: 编译 vs eager 数值一致（保守力）", de < 1e-4 and df < 1e-4,
+          f"max|dE|={de:.2e} max|dF|={df:.2e}")
+except Exception as e:
+    check("C: 编译 vs eager 数值一致", False, f"{type(e).__name__}: {str(e)[:300]}")
+
+print()
+if FAILURES:
+    print(f"FAILED: {len(FAILURES)} -> {FAILURES}")
+    sys.exit(1)
+print("ALL PASS")

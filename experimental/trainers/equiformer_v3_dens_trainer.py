@@ -183,6 +183,10 @@ def add_gaussian_noise_to_position(
         else:
             batch.noise_mask = noise_mask
 
+    # 加噪前留一份干净坐标，供 SCD 的 clean 前向使用（`all_atoms == False` 时
+    # 只有自由原子被位移，无法由 `pos - noise_vec` 反推）。
+    batch.pos_clean = batch.pos.clone()
+
     pos = batch.pos
     new_pos = pos + noise_vec
     if all_atoms:
