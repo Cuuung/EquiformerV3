@@ -1,0 +1,332 @@
+  #####################################################################################
+  #  E-G  ·  GRAD-STAGE PRECISION ISOLATION (single variable = grad-ft numerical stack)
+  #
+  #  Base = the A0-baseline gradft config, with the grad-stage acceleration reverted to
+  #  PURE fp32 EAGER:  matmul_precision high->highest (TF32 off) + enable_compile True->False.
+  #  Everything else identical to A0 gradft: moonshot muon_lr 1.5e-4, 5ep, loss e5-f10-s100,
+  #  bs 16x8x4, max_atoms 150, DPA4 switches all at baseline defaults, use_amp already False.
+  #
+  #  START ckpt (CLI-overridden by the submit script) = the EXISTING A0 bf16 direct ckpt --
+  #  direct stage is NOT retrained. So this run isolates the GRAD stage only:
+  #    * kappa -> ~0.46  => grad-stage TF32/compile was the eval killer; direct bf16 exonerated.
+  #    * kappa stays ~0.67 => damage is baked into the bf16 direct basin; needs a direct fp32 retrain.
+  #####################################################################################
+
+  #####################################################################################
+  #  DPA4 ABLATION ARM: A0-baseline
+  #  Base recipe: IDENTICAL to the moonshot N2L2C64 15ep+5ep ablation pair that produced
+  #  kappa_SRME 0.4638 / CPS 0.7302 (docs/KELLER_VS_MOONSHOT_N2L2C64.md). Two deltas vs it:
+  #    (1) maoruicong's precision / acceleration stack is now ON (see the block below) --
+  #        THIS IS WHY THE `dpa4-A0-baseline` ARM MUST BE RUN: 0.4638 was produced WITHOUT
+  #        the stack, so it is no longer a matched comparator. A0 restores the match.
+  #    (2) the DPA4 switches for this arm: ALL OFF (matched control for the new precision stack)
+  #####################################################################################
+dataset:
+  train:
+    format: ase_db
+    src:
+      - /mnt/afs/share/dataset/periodicSystem/MPtrj/aselmdb/train
+    a2g_args:
+      r_energy: True      # already use `uncorrected_total_energy` after pre-processing
+      r_forces: True
+      r_stress: True
+    transforms:
+      #decompose_tensor:
+      #  tensor: stress
+      #  rank: 2
+      #  decomposition:
+      #    stress_isotropic:
+      #      irrep_dim: 0
+      #    stress_anisotropic:
+      #      irrep_dim: 2
+
+      normalizer:
+        #######################################################################################
+        #   Use either `fit`, `file` or specifying everything
+        #   1.  If loading from a checkpoint, the values from using `fit` will be overwritten
+        #######################################################################################
+        #fit:
+        #  targets:
+        #    energy: { mean: 0.0}
+        #    forces: { mean: 0.0 }
+        #    stress: { mean: 0.0 }
+        #    #stress_isotropic: { }
+        #    #stress_anisotropic: { mean: 0.0 }
+        #  batch_size: 64
+        #  num_batches: 10000
+        #file: experimental/configs/omat24/mptrj/preprocessing/equiformer_v2_mptrj_normalizer.pt
+        energy:
+          mean:     0.0
+          rmsd:     0.8124567446457275    # (1) Following eSEN
+                                          # (2) Remove the division after sum aggregation for energy prediction
+        forces:
+          mean:     0.0
+          rmsd:     0.8124567446457275
+        stress:
+          mean:     0.0
+          rmsd:     0.8124567446457275
+        #isotropic_stress:
+        #  mean:     -0.003037823364138603
+        #  stdev:    0.06647835671901703
+        #anisotropic_stress:
+        #  mean:     0.0
+        #  stdev:    0.026824669912457466
+
+      element_references:
+        #######################################################################################
+        #   Use either `fit` or `file`
+        #   1.  If loading from a checkpoint, the values from using `fit` will be overwritten
+        #######################################################################################
+        #fit:
+        #  targets:
+        #    - energy
+        #  batch_size: 64
+        #  num_batches: 1000
+        #file: experimental/configs/omat24/mptrj/preprocessing/equiformer_v2_mptrj_element_references.pt
+        energy:
+          file: experimental/configs/omat24/mptrj/preprocessing/equiformer_v2_mptrj_energy_element_references.npz
+
+    max_atoms: 150        # ABLATION (mirrors the 30M recipe): 24000 was INERT (MPtrj max natoms=444). 150 drops only ~0.82% (the large-cell
+                          # tail) so the data pipeline matches the 30M gradft. Not needed for OOM on N2L2C64 (tiny model), kept for recipe fidelity.
+
+  val:
+    format: ase_db
+    src:
+      - /mnt/afs/share/dataset/periodicSystem/MPtrj/aselmdb/val
+    a2g_args:
+      r_energy: True      # already use `uncorrected_total_energy` after pre-processing
+      r_forces: True
+      r_stress: True
+
+
+trainer:              equiformer_v3_dens_trainer
+
+
+logger:
+  name:               wandb
+  project:            equiformer_v3_mptrj
+
+
+hide_eval_progressbar: False
+
+
+evaluation_metrics:
+  primary_metric: forces_mae
+  metrics:
+    energy:
+      - mae
+      - per_atom_mae
+    forces:
+      - mae
+      - cosine_similarity
+    stress:
+      - mae
+
+
+outputs:
+  energy:
+    level:                system
+    property:             energy
+  forces:
+    level:                atom
+    property:             forces
+    train_on_free_atoms:  True
+    eval_on_free_atoms:   True
+  stress:
+    level:                system
+    property:             stress
+
+
+loss_functions:
+  - energy:
+      fn:                 per_atom_mae
+      coefficient:        5      # CHANGED: E:F:S = 5:10:100 (was 20:20:5)
+  - forces:
+      fn:                 l2mae
+      coefficient:        10
+  - stress:
+      fn:                 mae
+      coefficient:        100
+
+
+model:
+  #####################################################################################
+  #  Architecture MUST stay identical to the direct-force stage-1 config so that
+  #  load_pretrained_weights can transfer the backbone + energy_block by shape match.
+  #  Only the force-prediction mechanism + regularization/DeNS switches differ.
+  #####################################################################################
+  name:                         equiformer_v3        # CHANGED: was equiformer_v3_dens (no DeNS head in finetune)
+
+  use_pbc:                      True
+  use_pbc_single:               True      # Process batch PBC graphs one at a time.
+                                          # This argument is set to True when training on MPtrj.
+  otf_graph:                    True
+
+  regress_forces:               True
+  regress_stress:               True
+  direct_prediction:            False     # CHANGED: forces = -dE/dx (conservative), stress from virial
+
+  max_neighbors:                300
+  max_radius:                   6.0
+  num_radial_basis:             10
+  max_num_elements:             128
+
+  num_layers:                   2          # identical to direct stage-1
+  num_channels:                 64
+  attn_hidden_channels:         32
+  num_heads:                    8
+  attn_alpha_channels:          64
+  attn_value_channels:          16
+  ffn_hidden_channels:          512
+  norm_type:                    'merge_layer_norm'  # ['sep_layer_norm', 'sep_layer_norm_liger']
+
+  lmax:                         2
+  mmax:                         2
+  attn_grid_resolution_list:    [14,  8]
+  ffn_grid_resolution_list:     [14, 14]
+
+  edge_channels:                128
+  use_atom_edge_embedding:      True
+  use_envelope:                 True
+
+  attn_activation:              'sep-merge_gates2_swiglu'   # kept same as direct for guaranteed weight transfer.
+                                                            # Official grad recipe uses '..._mem' (param-compatible,
+                                                            # activation-checkpointed) to save memory under double
+                                                            # backward; switch to it if memory-bound.
+  use_attn_renorm:              True
+  use_add_merge:                False
+  use_rad_l_parametrization:    True
+  softcap:                      null
+  ffn_activation:               'sep-merge_gates2_swiglu'
+  use_grid_mlp:                 True
+
+  use_gate_force_head:          True
+
+  alpha_drop:                   0.0
+  attn_mask_rate:               0.0
+  attn_weights_drop:            0.0       # CHANGED: drops off for short finetune (was 0.1)
+  value_drop:                   0.0
+  drop_path_rate:               0.0       # CHANGED: was 0.05
+  proj_drop:                    0.0
+  ffn_drop:                     0.0
+
+  gradient_checkpointing_block_list:    [0, 0]      # length == num_layers; set [1,1] to trade compute for memory
+
+  enforce_max_neighbors_strictly:       True
+
+  avg_num_nodes:                1       # Remove the division after sum aggregation over nodes for energy prediction
+
+
+  # ---- maoruicong precision + acceleration stack -----------------------------------
+  enable_compile:               False   # E-G TEST: grad-stage in-model compile OFF (pure eager). The compiled
+                                        # conservative double-backward is one of the two grad-stage precision vars
+                                        # under test here (the other is TF32 below).
+  compile_dynamic:              False   # (no-op when enable_compile is False; kept explicit)
+  use_amp:                      False   # block-scoped bf16 autocast (no GradScaler); geometry/Wigner stay fp32.
+                                        # MUTUALLY EXCLUSIVE with optim.amp/fp16 -- do NOT pass --amp.
+
+  # ---- DPA4 ablation switches ------------------------------------------------------
+  envelope_type:                'equiformerv3_c2'   # DEFAULT (C2 envelope) -- this arm is the matched control
+  attn_softmax_type:            'equiformerv3'      # DEFAULT
+  focus_compete_groups:         0                   # DEFAULT (off)
+
+optim:
+  #####################################################################################
+  #  Gradient-force = double backward, use_compile off, and MUST run fp32 (no --amp:
+  #  amp crashes Wigner construction in so3.py with a Float/Half index_put mismatch).
+  #  MEMORY note: per-GPU memory depends on per-GPU batch_size, NOT GPU count -- adding
+  #  GPUs only grows global batch/throughput, it does NOT reduce single-card usage.
+  #  On the real MPtrj train split (large structures, max_atoms 24000, load_balancing
+  #  atoms) batch 32/GPU pushed close to 100% (OOM risk), so per-GPU batch is set to 16
+  #  for headroom. To push higher (24-32) without OOM, enable gradient_checkpointing_
+  #  block_list: [1, 1] above (trades compute for memory).
+  #####################################################################################
+  batch_size:                   16      # per-GPU; fp32. 8 GPU x 16 x accum4 = global 512 (mirrors the 30M gradft global batch). N2L2C64 is tiny -> no OOM.
+  grad_accumulation_steps:      4
+  eval_batch_size:              16
+  load_balancing:               atoms
+  num_workers:                  0       # lmdb env not fork-safe -> num_workers>0 segfaults
+  lr_initial:                   0.00005 # 5e-5: AdamW lr for the NON-matrix params (biases, norms, embeddings)
+
+  #####################################################################################
+  #  Muon counterpart of the 40ep AdamW grad-ft config, shortened to 25 epochs:
+  #    ...pt-dens-ft-no-reg_lr@5e-5-epochs@40-bs@16x16-wd@1e-3-beta2@0.95_loss-e5-f10-s100.yml
+  #  Differences vs that AdamW config: optimizer block below (HybridMuon) + its lr, and
+  #    max_epochs 40 -> 25. Everything else (arch, batch 16/GPU, fp32, no compile) is the same.
+  #
+  #  HybridMuon: Muon (Newton-Schulz orthogonalized momentum) for the weight matrices
+  #  (nn.Linear 2D + SO3Linear 3D), AdamW for biases / norms / embeddings.
+  #  - This is a FINETUNE from the direct-force checkpoint, so lr is kept low.
+  #    muon_lr 5e-3 keeps the same ~100x matrix:AdamW ratio used by the direct config
+  #    (2e-2 / 2e-4). muon_lr is the main knob -- lower it (e.g. 2e-3) if the loaded
+  #    weights get disturbed too fast.
+  #  - lr_initial (above) is the AdamW lr applied to the non-matrix params.
+  #  - fp32 only (no --amp). Under plain DDP this is correct (grads all-reduced before
+  #    step -> identical Muon updates on every rank). use_compile stays OFF (double
+  #    backward of gradient forces is unstable with torch.compile).
+  #####################################################################################
+  optimizer:                    HybridMuon
+  optimizer_params:
+    weight_decay:               0.001
+    update_scale:               moonlight # ABLATION: ratio -> moonlight (shape-decoupled 0.2*sqrt(max(rows,cols))). REQUIRES the moonlight muon_lr below.
+    muon_lr:                    0.00015   # moonlight gradft = direct(4e-4) x ~0.33 ~= 1.5e-4, mirroring the 30M recipe's direct->gradft ratio (1.5e-4->5e-5).
+                                          # Finetune from a converged ckpt -> conservative step. muon_lr is the main knob; watch ep1 for "Found nans"/SKIPPED.
+    momentum:                   0.95      # Muon momentum
+    nesterov:                   True      # Muon nesterov look-ahead
+    ns_steps:                   5         # Newton-Schulz iterations
+    betas:                      [0.9, 0.95]   # AdamW path
+    eps:                        1.0e-8
+    # --- Muon-side divergence guard [skip-step protection] ----------------------------
+    #  Same guard as the direct stage. clip_grad_norm is inert for the Muon group; this
+    #  acts on the orthogonalized update. DDP-safe (synced grads -> identical skip/rank).
+    skip_nonfinite:             True   # NaN/Inf grad -> skip the matrix WITHOUT poisoning its
+                                       #   momentum buffer (watch epoch 1: gradft has no Muon validation yet)
+    spike_factor:               8.0    # skip a matrix when its Newton-Schulz-input RMS jumps >8x its EMA
+    spike_ema_decay:            0.99   # EMA decay for the per-matrix RMS baseline
+    spike_warmup_steps:         200    # no spike-skips until the EMA has stabilized
+    spike_max_consecutive_skips: 25    # deadlock backstop: force-commit + re-baseline a matrix after 25 consecutive skips
+    spike_abs_threshold:        null   # DISABLED for N2L2C64 (abs=4.0 is a 30M tuning; small-model NS-input RMS naturally ~5-8 -> false abort). skip_nonfinite + 8x-EMA stay on.
+    spike_abs_max_consecutive:  10     # consecutive over-threshold steps before abort
+    log_every:                  200    # master-rank periodic "max NS-input RMS" log (skips always logged)
+  scheduler:                    LambdaLR
+  scheduler_params:
+    lambda_type:                cosine
+    warmup_factor:              0.0
+    warmup_epochs:              0.1
+    lr_min_factor:              0.01
+
+  max_epochs:                   5       # ABLATION: short 5ep gradient-force finetune (cheap N2L2C64 proxy of the 30M 10ep gradft)
+  clip_grad_norm:               100
+  ema_decay:                    0.999
+
+  eval_every:                   5000
+
+  use_denoising_pos:            False   # CHANGED: no DeNS auxiliary task during finetune
+  denoising_pos_params:
+    prob:                       0.5
+    fixed_noise_std:            True
+    std:                        0.025
+    corrupt_ratio:              0.5
+    num_steps:                  50    # not used
+    std_low:                    0.01  # not used
+    std_high:                   0.5   # not used
+    min_num_atoms:              null
+    strict_max_ratio:           0.75
+  denoising_pos_coefficient:    10
+
+  matmul_precision:             highest # E-G TEST: TF32 OFF -> pure fp32 matmul. This is THE variable most likely to
+                                        # hurt kappa: the conservative -dE/dx double-backward runs its matmuls here, and
+                                        # kappa_SRME reads FC3 (a derivative of that path). Reverting it to fp32 isolates
+                                        # whether the grad-stage acceleration is the eval-metric killer.
+  use_compile:                  False   # CHANGED: torch.compile is unstable with the double backward of gradient forces
+
+  #####################################################################################
+  #  Stage-1 direct-force checkpoint to finetune from.
+  #  NOTE: when launched via the two-stage pipeline script this path is OVERRIDDEN on the
+  #  CLI (--optim.load_pretrained_weights=<stage-1 best_checkpoint.pt>), so the value
+  #  below is only a placeholder for standalone runs. Non-strict shape-checked partial
+  #  load (equiformer_v3_dens_trainer.py:1103-1127): backbone + energy_block transfer;
+  #  direct force/stress/dens heads auto-skipped. If an energy_block shape assert fires,
+  #  strip energy_block keys from the ckpt first ("no-energy_block").
+  #####################################################################################
+  load_pretrained_weights:      /mnt/afs/share/checkpoint/equiformerV3/yaolekai/checkpoints/2026-06-07-11-24-48-mptrj_direct_N@2_L@2_C@64_60ep/best_checkpoint.pt
