@@ -333,3 +333,107 @@ class RMSNorm(torch.nn.Module):
 
     def __repr__(self):
         return f"{self.__class__.__name__}(num_channels={self.num_channels}, eps={self.eps})"
+
+
+class EquivariantAdaNorm(torch.nn.Module):
+    """等变特征上的 Adaptive LayerNorm（SCD v1）。
+
+    包住现有的等变 norm，由条件向量额外产出 (shift, scale, gate)：
+      - `scale` / `gate` 是不变标量，同一 (l, c) 内所有 m 分量共享同一个值
+        （由 `expand_index` 保证），故乘上去仍等变；
+      - `shift` 只加在 L=0，故加上去仍等变。
+
+    `fc` 末层零初始化，且 `scale` / `gate` 以 `1 + delta` 读出 —— 未训练时本层
+    逐位等价于原 norm，既有 ckpt 可无损续训（不同于 DiT 的 zero-init gate，
+    那会让残差支在 step 0 完全关闭）。
+
+    Args:
+        scope: 'per_degree' 每个 degree 独立的 scale/gate；'shared' 全 degree 共享；
+               'l0_only' 只调制 L=0（对齐参考实现 `dx*gate_x, dvec` 的严格形态）。
+        use_node_feat: 是否把本节点的 L=0 特征（detach）拼进条件 MLP 的输入。
+    """
+
+    _SCOPES = ('per_degree', 'shared', 'l0_only')
+
+    def __init__(
+        self,
+        norm_type,
+        lmax,
+        num_channels,
+        cond_channels,
+        scope='per_degree',
+        use_node_feat=True,
+        eps=1e-5,
+        affine=True,
+        normalization='component'
+    ):
+        super().__init__()
+        assert scope in self._SCOPES, f"unknown scope: {scope}"
+        self.lmax = lmax
+        self.num_channels = num_channels
+        self.cond_channels = cond_channels
+        self.scope = scope
+        self.use_node_feat = use_node_feat
+
+        self.norm = get_normalization_layer(
+            norm_type, lmax, num_channels, eps, affine, normalization
+        )
+
+        self.num_mod_degrees = (lmax + 1) if scope == 'per_degree' else 1
+        out_channels = num_channels + 2 * self.num_mod_degrees * num_channels
+        in_channels = cond_channels + (num_channels if use_node_feat else 0)
+
+        self.fc = torch.nn.Sequential(
+            torch.nn.Linear(in_channels, num_channels),
+            torch.nn.SiLU(),
+            torch.nn.LayerNorm(num_channels),
+            torch.nn.Linear(num_channels, out_channels),
+        )
+        torch.nn.init.constant_(self.fc[-1].weight, 0.0)
+        torch.nn.init.constant_(self.fc[-1].bias, 0.0)
+
+        expand_index = torch.zeros([(lmax + 1) ** 2]).long()
+        for l in range(lmax + 1):
+            start_idx = l ** 2
+            length = 2 * l + 1
+            expand_index[start_idx : (start_idx + length)] = l
+        self.register_buffer('expand_index', expand_index)
+
+        l0_mask = torch.zeros(1, (lmax + 1) ** 2, 1)
+        l0_mask[0, 0, 0] = 1.0
+        self.register_buffer('l0_mask', l0_mask)
+
+    def __repr__(self):
+        return (f"{self.__class__.__name__}(lmax={self.lmax}, "
+                f"num_channels={self.num_channels}, cond_channels={self.cond_channels}, "
+                f"scope={self.scope}, use_node_feat={self.use_node_feat})")
+
+    def _broadcast(self, v):
+        """[N, num_mod_degrees, C] -> 可与 [N, (lmax+1)**2, C] 相乘的 delta。"""
+        if self.scope == 'per_degree':
+            return torch.index_select(v, dim=1, index=self.expand_index)
+        if self.scope == 'shared':
+            return v                                    # [N, 1, C]，靠广播
+        return v * self.l0_mask.to(v.dtype)             # l0_only：只有 L=0 非零
+
+    def forward(self, x, cond=None):
+        x = self.norm(x)
+        if cond is None:
+            return x, None
+
+        if self.use_node_feat:
+            node_feat = x.narrow(1, 0, 1).squeeze(1).detach()
+            inp = torch.cat([cond, node_feat], dim=-1)
+        else:
+            inp = cond
+
+        out = self.fc(inp).to(x.dtype)
+        c, d = self.num_channels, self.num_mod_degrees
+        shift = out.narrow(1, 0, c)
+        scale = out.narrow(1, c, d * c).view(-1, d, c)
+        gate = out.narrow(1, c + d * c, d * c).view(-1, d, c)
+
+        x = x * (1.0 + self._broadcast(scale))
+        # shift 只进 L=0，out-of-place（避免 version-counter / make_fx 问题）
+        x = x + shift.unsqueeze(1) * self.l0_mask.to(x.dtype)
+        return x, 1.0 + self._broadcast(gate)
