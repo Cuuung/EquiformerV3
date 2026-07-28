@@ -335,6 +335,46 @@ try:
 except Exception as e:
     check("C: 编译 vs eager 数值一致", False, f"{type(e).__name__}: {str(e)[:300]}")
 
+# ------------------- D. plain_compile region (enable_compile + direct)
+# SCD 自身不引入二次反传，direct 模式走的是 plain_compile(core_compute)，
+# 而非保守力那条 make_fx 路径。
+try:
+    torch._dynamo.reset()
+    m5 = build(direct_prediction=True, enable_compile=True, compile_dynamic=False)
+    m5.train()
+    with torch.no_grad():
+        m5.scd_cond_proj.weight.normal_(0, 0.05)
+    run_two_steps(m5, "D/model.enable_compile + direct (plain_compile)", seeds=(31, 32))
+    check("D: _compiled_core 已建立", m5._compiled_core is not None)
+
+    # clean 前向必须留在 eager，否则会为 clean 图的形状再触发一次编译
+    calls = {"n": 0}
+    orig_cc = m5.core_compute
+    m5.core_compute = lambda *a, **k: (calls.__setitem__("n", calls["n"] + 1), orig_cc(*a, **k))[1]
+    m5(add_noise(make_batch(seed=33)))
+    m5.core_compute = orig_cc
+    check("D: clean 前向走 eager core_compute，主前向用 _compiled_core",
+          calls["n"] == 1, f"eager 调用={calls['n']}")
+
+    torch._dynamo.reset()
+    torch.manual_seed(99)
+    m6 = build(direct_prediction=True)
+    with torch.no_grad():
+        m6.scd_cond_proj.weight.normal_(0, 0.05)
+    sd6 = {k: v.clone() for k, v in m6.state_dict().items()}
+    m7 = build(direct_prediction=True, enable_compile=True, compile_dynamic=False)
+    m7.load_state_dict(sd6)
+    m6.train(); m7.train()
+    torch.manual_seed(7); b6 = add_noise(make_batch(seed=41)); o6 = m6(b6)
+    torch.manual_seed(7); b7 = add_noise(make_batch(seed=41)); o7 = m7(b7)
+    assert torch.equal(b6.pos, b7.pos), "两侧输入不一致，测试无效"
+    de = (o6["energy"] - o7["energy"]).abs().max().item()
+    df = (o6["forces"] - o7["forces"]).abs().max().item()
+    check("D: plain_compile vs eager 数值一致", de < 1e-4 and df < 1e-4,
+          f"max|dE|={de:.2e} max|dF|={df:.2e}")
+except Exception as e:
+    check("D/plain_compile", False, f"{type(e).__name__}: {str(e)[:300]}")
+
 print()
 if FAILURES:
     print(f"FAILED: {len(FAILURES)} -> {FAILURES}")
