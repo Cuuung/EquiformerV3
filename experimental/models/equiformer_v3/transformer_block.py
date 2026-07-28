@@ -16,7 +16,8 @@ from .activation import (
 )
 from .layer_norm import (
     get_normalization_layer,
-    RMSNorm
+    RMSNorm,
+    EquivariantAdaNorm
 )
 from .radial_function import RadialFunction
 from .so2_ops import SO2Linear
@@ -619,6 +620,12 @@ class TransBlockV3(torch.nn.Module):
             drop_path_rate (float):     Drop path rate
             proj_drop (float):          Dropout rate for outputs of attention and FFN
             ffn_drop (float):           Dropout rate for the hidden features in FFN
+
+            cond_channels (int):        Default: None
+                                        Dimension of the SCD condition vector `cond`. `None` disables AdaNorm.
+            adanorm_targets (tuple):    Which pre-norms use AdaNorm: subset of `('attn', 'ffn')`.
+            adanorm_scope (str):        Scope passed to `EquivariantAdaNorm` when AdaNorm is enabled.
+            adanorm_use_node_feat (bool): Whether AdaNorm's condition MLP also sees the node's own L=0 feature.
     """
     def __init__(
         self,
@@ -652,11 +659,25 @@ class TransBlockV3(torch.nn.Module):
         value_drop=0.0,
         drop_path_rate=0.0,
         proj_drop=0.0,
-        ffn_drop=0.0
+        ffn_drop=0.0,
+        cond_channels=None,
+        adanorm_targets=(),
+        adanorm_scope='per_degree',
+        adanorm_use_node_feat=True
     ):
         super().__init__()
 
-        self.norm_1 = get_normalization_layer(norm_type, lmax=lmax, num_channels=num_in_channels)
+        self.use_adanorm_1 = ('attn' in adanorm_targets) and (cond_channels is not None)
+        self.use_adanorm_2 = ('ffn' in adanorm_targets) and (cond_channels is not None)
+
+        if self.use_adanorm_1:
+            self.norm_1 = EquivariantAdaNorm(
+                norm_type, lmax=lmax, num_channels=num_in_channels,
+                cond_channels=cond_channels, scope=adanorm_scope,
+                use_node_feat=adanorm_use_node_feat
+            )
+        else:
+            self.norm_1 = get_normalization_layer(norm_type, lmax=lmax, num_channels=num_in_channels)
 
         self.ga = EquivariantGraphAttention(
             num_in_channels=num_in_channels,
@@ -692,7 +713,14 @@ class TransBlockV3(torch.nn.Module):
         self.drop_path = GraphDropPath(drop_path_rate) #if drop_path_rate > 0.0 else None
         self.proj_drop = EquivariantDropout(lmax=lmax, mmax=lmax, drop_prob=proj_drop) if proj_drop > 0.0 else None
 
-        self.norm_2 = get_normalization_layer(norm_type, lmax=lmax, num_channels=num_in_channels)
+        if self.use_adanorm_2:
+            self.norm_2 = EquivariantAdaNorm(
+                norm_type, lmax=lmax, num_channels=num_in_channels,
+                cond_channels=cond_channels, scope=adanorm_scope,
+                use_node_feat=adanorm_use_node_feat
+            )
+        else:
+            self.norm_2 = get_normalization_layer(norm_type, lmax=lmax, num_channels=num_in_channels)
 
         self.ffn = FeedForwardNetwork(
             num_in_channels=num_in_channels,
@@ -720,12 +748,16 @@ class TransBlockV3(torch.nn.Module):
         edge_distance,
         edge_index,
         edge_envelope_weight=None,  # for smooth cutoff
-        batch=None                  # for GraphDropPath
+        batch=None,                 # for GraphDropPath
+        cond=None                   # for SCD AdaNorm，[N, cond_channels]
     ):
         outputs = x
         x_res = x
 
-        outputs = self.norm_1(outputs)
+        if self.use_adanorm_1:
+            outputs, gate_1 = self.norm_1(outputs, cond)
+        else:
+            outputs, gate_1 = self.norm_1(outputs), None
         outputs = self.ga(
             outputs,
             source_atomic_numbers,
@@ -734,6 +766,8 @@ class TransBlockV3(torch.nn.Module):
             edge_index,
             edge_envelope_weight
         )
+        if gate_1 is not None:
+            outputs = outputs * gate_1
 
         if self.drop_path is not None:
             outputs = self.drop_path(outputs, batch)
@@ -743,8 +777,13 @@ class TransBlockV3(torch.nn.Module):
         outputs = outputs + x_res
 
         x_res = outputs
-        outputs = self.norm_2(outputs)
+        if self.use_adanorm_2:
+            outputs, gate_2 = self.norm_2(outputs, cond)
+        else:
+            outputs, gate_2 = self.norm_2(outputs), None
         outputs = self.ffn(outputs)
+        if gate_2 is not None:
+            outputs = outputs * gate_2
 
         if self.drop_path is not None:
             outputs = self.drop_path(outputs, batch)

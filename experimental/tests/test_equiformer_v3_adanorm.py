@@ -123,6 +123,63 @@ check("use_node_feat=False: fc 输入维 == cond_channels",
 out, gate = m(*rand_inputs())
 check("use_node_feat=False: 前向可跑", out.shape == (N, (LMAX + 1) ** 2, C))
 
+# =============================== TransBlockV3 ===============================
+from fairchem.experimental.models.equiformer_v3.transformer_block import TransBlockV3
+from fairchem.experimental.models.equiformer_v3.so3 import SO3Rotation as _SO3Rot
+
+BL, BC, BCOND = 2, 16, 12
+
+
+def make_block(targets=('attn', 'ffn')):
+    torch.manual_seed(0)
+    so3_rotation = _SO3Rot(BL, BL, use_rotation_mask=False).to(DEV)
+    return TransBlockV3(
+        num_in_channels=BC, attn_hidden_channels=8, num_heads=2,
+        attn_alpha_channels=8, attn_value_channels=4, ffn_hidden_channels=16,
+        num_out_channels=BC, lmax=BL, mmax=BL, so3_rotation=so3_rotation,
+        attn_grid_resolution_list=[14, 8], ffn_grid_resolution_list=[14, 14],
+        max_num_elements=32, edge_channels_list=[8, 8, 8],
+        norm_type='merge_layer_norm', drop_path_rate=0.0,
+        cond_channels=BCOND, adanorm_targets=targets,
+    ).to(DEV)
+
+
+b = make_block()
+check("block: attn/ffn 两处都建成 AdaNorm", b.use_adanorm_1 and b.use_adanorm_2)
+check("block: norm_1 是 EquivariantAdaNorm", isinstance(b.norm_1, EquivariantAdaNorm))
+check("block: norm_2 是 EquivariantAdaNorm", isinstance(b.norm_2, EquivariantAdaNorm))
+
+b_attn = make_block(targets=('attn',))
+check("block: 只指定 attn 时 norm_2 退回普通 norm",
+      b_attn.use_adanorm_1 and not b_attn.use_adanorm_2
+      and not isinstance(b_attn.norm_2, EquivariantAdaNorm))
+
+b_none = make_block(targets=())
+check("block: targets 为空时两处都是普通 norm",
+      not b_none.use_adanorm_1 and not b_none.use_adanorm_2)
+
+# identity-init：带 cond 与不带 cond 的输出必须一致
+torch.manual_seed(3)
+NB = 6
+xb = torch.randn(NB, (BL + 1) ** 2, BC, device=DEV)
+ei = torch.tensor([[0, 1, 2, 3, 4, 5], [1, 2, 3, 4, 5, 0]], device=DEV)
+edge_dist = torch.rand(ei.shape[1], 8, device=DEV)
+san = torch.randint(1, 30, (ei.shape[1],), device=DEV)
+tan = torch.randint(1, 30, (ei.shape[1],), device=DEV)
+bidx = torch.zeros(NB, dtype=torch.long, device=DEV)
+condb = torch.randn(NB, BCOND, device=DEV)
+b.eval()
+with torch.no_grad():
+    # set_wigner_from_eulers 期望 (alpha, beta, gamma) 三元组，每个 shape (num_edges,)
+    eulers = tuple(torch.zeros(ei.shape[1], device=DEV) for _ in range(3))
+    b.ga.so3_rotation.set_wigner_from_eulers(eulers)
+    o_cond = b(xb, san, tan, edge_dist, ei, None, bidx, condb)
+    b.ga.so3_rotation.set_wigner_from_eulers(eulers)
+    o_none = b(xb, san, tan, edge_dist, ei, None, bidx, None)
+check("block identity-init: 有无 cond 输出一致",
+      torch.allclose(o_cond, o_none, atol=1e-6),
+      f"max|d|={(o_cond - o_none).abs().max().item():.2e}")
+
 print()
 if FAILURES:
     print(f"FAILED: {len(FAILURES)} -> {FAILURES}")
