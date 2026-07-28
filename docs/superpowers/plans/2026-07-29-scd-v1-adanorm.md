@@ -697,10 +697,12 @@ DeNS 三条前向经 _forward_cond 钩子取 cond（基类返回 None）；编�
 ### Task 4: `scd_inject` 开关与 AdaNorm 下发
 
 **Files:**
+- Modify: `experimental/models/equiformer_v3/equiformer_v3.py`（抽出 `_build_block_config`，纯重构）
 - Modify: `experimental/models/equiformer_v3/equiformer_v3_scd.py`
 - Modify: `experimental/tests/test_equiformer_v3_scd.py`
 
 **Interfaces:**
+- Produces: `EquiformerV3_OC._build_block_config(i) -> dict`（父类工厂方法，子类复用）
 - Consumes: `_forward_cond` 钩子、`TransBlockV3(cond_channels=...)`、`EquivariantAdaNorm`
 - Produces:
   - `EquiformerV3SCD_OC(..., scd_inject='adanorm', scd_adanorm_targets=('attn', 'ffn'), scd_adanorm_scope='per_degree', scd_adanorm_use_node_feat=True, ...)`
@@ -823,67 +825,79 @@ Expected: `TypeError: __init__() got an unexpected keyword argument 'scd_inject'
             )
 ```
 
-新增方法：
+**先把父类的 block 配置抽成工厂方法**（避免在子类里逐字复制 32 个超参 —— 两处
+参数表手动同步迟早脱节）。在 `equiformer_v3.py` 中，把 `__init__` 里
+`# Transformer block` 之后的循环体（约 291-334 行）：
+
+```python
+        # Transformer block
+        self.blocks = torch.nn.ModuleList()
+        for i in range(self.num_layers):
+            if self.gradient_checkpointing_block_list[i] == 1:
+                attn_activation = self.attn_activation.replace('_mem', '')
+                ...
+            block_config_dict = dict(...)
+            block_class = TransBlockV3
+            self.blocks.append(block_class(**block_config_dict))
+```
+
+改为：
+
+```python
+        # Transformer block
+        self.blocks = torch.nn.ModuleList()
+        for i in range(self.num_layers):
+            self.blocks.append(TransBlockV3(**self._build_block_config(i)))
+```
+
+并新增方法（把原来的 `block_config_dict` 构造原样搬进来，**内容一字不改**，
+只是把 `attn_activation` / `ffn_activation` 的分支一并纳入）：
+
+```python
+    def _build_block_config(self, i):
+        """第 i 个 TransBlockV3 的构造参数。
+
+        抽成方法以便子类（如 SCD 的 AdaNorm 变体）在同一份参数表上做增量，
+        不必复制整张表。
+        """
+        if self.gradient_checkpointing_block_list[i] == 1:
+            attn_activation = self.attn_activation.replace('_mem', '')
+            ffn_activation  = self.ffn_activation.replace('_mem', '')
+        else:
+            attn_activation = self.attn_activation
+            ffn_activation  = self.ffn_activation
+        return dict(
+            # …… 原 block_config_dict 的全部键值，原样搬入 ……
+        )
+```
+
+> **实现者注意：** 这一步是**纯重构，不得有行为变化**。搬完先跑
+> `RUN experimental/tests/test_equiformer_v3_scd.py`（v0 的 24 项）确认全绿，
+> 再继续下面的 AdaNorm 部分。原循环里若还有 `attn_weights_drop` 之类的
+> checkpointing 分支逻辑，一并搬进 `_build_block_config`。
+
+然后在 SCD 子类新增：
 
 ```python
     def _rebuild_blocks_with_adanorm(self, targets, scope, use_node_feat):
-        """按原 block 的构造参数重建 TransBlockV3，把两处 pre-norm 换成 AdaNorm。
+        """在父类的 block 参数表上做增量，把两处 pre-norm 换成 AdaNorm。
 
-        父类 `__init__` 已按配置建好 `self.blocks`，这里逐个用相同超参重建并
-        追加 AdaNorm 相关参数。重建发生在 `self.apply(self._init_weights)` 之前，
+        父类 `__init__` 已建好 `self.blocks`，这里按同一份配置重建并追加
+        AdaNorm 相关参数。重建发生在 `self.apply(self._init_weights)` 之前，
         因此新模块同样会被正常初始化。
         """
         new_blocks = torch.nn.ModuleList()
         for i in range(self.num_layers):
-            attn_activation = self.attn_activation
-            ffn_activation = self.ffn_activation
-            attn_weights_drop = self.attn_weights_drop
-            if self.gradient_checkpointing_block_list[i] == 1:
-                attn_activation = attn_activation.replace('_mem', '')
-                ffn_activation = ffn_activation.replace('_mem', '')
-            new_blocks.append(TransBlockV3(
-                num_in_channels=self.num_channels,
-                attn_hidden_channels=self.attn_hidden_channels,
-                num_heads=self.num_heads,
-                attn_alpha_channels=self.attn_alpha_channels,
-                attn_value_channels=self.attn_value_channels,
-                ffn_hidden_channels=self.ffn_hidden_channels,
-                num_out_channels=self.num_channels,
-                lmax=self.lmax,
-                mmax=self.mmax,
-                so3_rotation=self.so3_rotation,
-                attn_grid_resolution_list=self.attn_grid_resolution_list,
-                ffn_grid_resolution_list=self.ffn_grid_resolution_list,
-                max_num_elements=self.max_num_elements,
-                edge_channels_list=self.edge_channels_list,
-                use_atom_edge_embedding=self.use_atom_edge_embedding,
-                attn_activation=attn_activation,
-                use_attn_renorm=self.use_attn_renorm,
-                use_add_merge=self.use_add_merge,
-                use_rad_l_parametrization=self.use_rad_l_parametrization,
-                softcap=self.softcap,
-                attn_eps=self.attn_eps,
-                ffn_activation=ffn_activation,
-                use_grid_mlp=self.use_grid_mlp,
-                norm_type=self.norm_type,
-                alpha_drop=self.alpha_drop,
-                attn_mask_rate=self.attn_mask_rate,
-                attn_weights_drop=attn_weights_drop,
-                value_drop=self.value_drop,
-                drop_path_rate=self.drop_path_rate,
-                proj_drop=self.proj_drop,
-                ffn_drop=self.ffn_drop,
+            cfg = self._build_block_config(i)
+            cfg.update(
                 cond_channels=self.num_channels,
                 adanorm_targets=targets,
                 adanorm_scope=scope,
                 adanorm_use_node_feat=use_node_feat,
-            ))
+            )
+            new_blocks.append(TransBlockV3(**cfg))
         self.blocks = new_blocks
 ```
-
-> **已核实：** 上面用到的 32 个超参（`attn_hidden_channels` … `gradient_checkpointing_block_list`）
-> 在 `EquiformerV3_OC.__init__` 中**全部**已存为 `self.*`，无需改父类。若落地时报
-> `AttributeError`，说明父类被改动过，回到 `block_config_dict`（`equiformer_v3.py:300-333`）核对。
 
 把 v0 的 `_scd_cond_embedding` 拆成两段：
 
@@ -1129,26 +1143,7 @@ muon.py:432 与 base_trainer.py:774 都跳过 requires_grad=False，
 
 ```python
 # ================= clean 前向正则化噪声（Task 6） =================
-mr = build(scd_reg_noise_std=0.01)
-mr.train()
-seen = {}
-orig_clean = mr._scd_clean_cond
-
-
-def _spy(data, num_graphs):
-    seen["pos_at_call"] = data.pos_clean.clone()
-    return orig_clean(data, num_graphs)
-
-
-mr._scd_clean_cond = _spy
-br = add_noise(make_batch(seed=80))
-pos_clean_before = br.pos_clean.clone()
-mr(br)
-check("scd_reg_noise_std>0: clean 前向被扰动",
-      "pos_at_call" in seen, "钩子被调用")
-mr._scd_clean_cond = orig_clean
-
-# 默认 0 时 clean 坐标必须保持不变
+# 默认 0 时 clean 坐标必须保持不变（reg noise 是 out-of-place 的，不污染 batch）
 m0 = build(scd_reg_noise_std=0.0)
 m0.train()
 b0 = add_noise(make_batch(seed=81))
@@ -1157,17 +1152,40 @@ m0(b0)
 check("scd_reg_noise_std=0: pos_clean 不被修改",
       torch.equal(b0.pos_clean, before))
 
-# 相同输入两次前向，reg noise 应带来不同的条件向量
-mr2 = build(scd_reg_noise_std=0.05)
-mr2.train()
-b1 = add_noise(make_batch(seed=82))
+# reg noise 开启时 pos_clean 同样不该被就地改写
+mr0 = build(scd_reg_noise_std=0.05)
+mr0.train()
+br0 = add_noise(make_batch(seed=83))
+before_r = br0.pos_clean.clone()
+mr0(br0)
+check("scd_reg_noise_std>0: pos_clean 仍不被就地改写",
+      torch.equal(br0.pos_clean, before_r))
+
+# 关掉 dropcond 以隔离变量：条件向量的差异必须只来自 reg noise
+bq = add_noise(make_batch(seed=82))
+m_on = build(scd_reg_noise_std=0.05, scd_p_dropcond=0.0)
+m_off = build(scd_reg_noise_std=0.0, scd_p_dropcond=0.0)
+m_on.train()
+m_off.train()
+
 torch.manual_seed(1)
-c1 = mr2._scd_cond_vector(b1)
+a1 = m_on._scd_cond_vector(bq)
 torch.manual_seed(2)
-c2 = mr2._scd_cond_vector(b1)
-check("reg noise 使两次 clean 前向的条件不同",
-      not torch.allclose(c1, c2, atol=1e-6))
+a2 = m_on._scd_cond_vector(bq)
+check("reg noise 开: 两次 clean 前向的条件不同",
+      not torch.allclose(a1, a2, atol=1e-6))
+
+torch.manual_seed(1)
+c1 = m_off._scd_cond_vector(bq)
+torch.manual_seed(2)
+c2 = m_off._scd_cond_vector(bq)
+check("对照组 reg noise 关: 两次 clean 前向的条件相同",
+      torch.allclose(c1, c2, atol=1e-6))
 ```
+
+> **实现者注意：** 上面的对照组是这一项的关键 —— 没有它，`scd_reg_noise_std`
+> 实际未生效时测试同样会绿（dropcond 的随机性足以让两次结果不同）。
+> 两个模型都必须 `scd_p_dropcond=0.0`。
 
 - [ ] **Step 2: 运行确认失败**
 
@@ -1200,7 +1218,7 @@ Expected: `TypeError: unexpected keyword argument 'scd_reg_noise_std'`
 
 `RUN experimental/tests/test_equiformer_v3_scd.py`
 
-Expected: `ALL PASS`（51 项）
+Expected: `ALL PASS`（52 项）
 
 - [ ] **Step 5: Commit**
 
@@ -1492,7 +1510,7 @@ RUN experimental/tests/test_equiformer_v3_scd.py
 RUN experimental/tests/test_element_embedding_diag.py
 ```
 
-Expected: 三个都 `ALL PASS`（分别 18 / 51 / 5 项）
+Expected: 三个都 `ALL PASS`（分别 18 / 52 / 5 项）
 
 - [ ] **Step 6: 更新文档**
 
@@ -1560,7 +1578,7 @@ eager/编译模型都要传同一个 `scd_inject=_mode`。
 
 `RUN experimental/tests/test_equiformer_v3_scd.py`
 
-Expected: `ALL PASS`。编译段从 8 项变为 16 项，总计 59 项。
+Expected: `ALL PASS`。编译段从 8 项变为 16 项，总计 60 项。
 
 若 B/D 段在 `adanorm` 下报 stale-bake 或形状错误，检查 Task 3 中
 `_conservative_compiled_forward` 的 `force_args` / `force_dyn` / `_prime` 三处是否
