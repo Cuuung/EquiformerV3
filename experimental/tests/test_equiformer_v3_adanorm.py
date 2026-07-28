@@ -86,6 +86,19 @@ for scope in ("per_degree", "shared", "l0_only"):
     gerr = (gate_a - gate_b).abs().max().item()
     check(f"gate 旋转不变 scope={scope}", gerr < 1e-4, f"max|d|={gerr:.2e}")
 
+# gate 契约：与 x 广播兼容；shared 下有意不展开
+for scope in ("per_degree", "shared", "l0_only"):
+    m = make(scope)
+    x, cond = rand_inputs()
+    out, gate = m(x, cond)
+    check(f"gate 与 x 广播兼容 scope={scope}",
+          (out * gate).shape == out.shape, f"gate={tuple(gate.shape)}")
+
+m = make("shared")
+x, cond = rand_inputs()
+check("shared 下 gate 有意保持 [N, 1, C] 不展开",
+      m(x, cond)[1].shape == (N, 1, C))
+
 # 4. l0_only 只动 L=0
 m = make("l0_only")
 with torch.no_grad():

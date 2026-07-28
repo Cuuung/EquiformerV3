@@ -351,6 +351,14 @@ class EquivariantAdaNorm(torch.nn.Module):
         scope: 'per_degree' 每个 degree 独立的 scale/gate；'shared' 全 degree 共享；
                'l0_only' 只调制 L=0（对齐参考实现 `dx*gate_x, dvec` 的严格形态）。
         use_node_feat: 是否把本节点的 L=0 特征（detach）拼进条件 MLP 的输入。
+
+    Returns:
+        (x_out, gate)：`x_out` 形状与输入相同；`gate` 是**与 x 广播兼容**的张量，
+        具体形状随 scope 而定 ——
+          per_degree -> [N, (lmax+1)**2, C]
+          shared     -> [N, 1, C]（不展开，靠广播，省一份完整激活）
+          l0_only    -> [N, (lmax+1)**2, C]
+        `cond is None` 时返回 (norm(x), None)。
     """
 
     _SCOPES = ('per_degree', 'shared', 'l0_only')
@@ -413,7 +421,7 @@ class EquivariantAdaNorm(torch.nn.Module):
         if self.scope == 'per_degree':
             return torch.index_select(v, dim=1, index=self.expand_index)
         if self.scope == 'shared':
-            return v                                    # [N, 1, C]，靠广播
+            return v                                    # [N, 1, C]，契约允许不展开，靠广播省激活
         return v * self.l0_mask.to(v.dtype)             # l0_only：只有 L=0 非零
 
     def forward(self, x, cond=None):
