@@ -265,6 +265,39 @@ def compute_atomwise_denoising_pos_and_force_hybrid_loss(
     return loss
 
 
+def element_embedding_norms(model):
+    """三组元素嵌入的 L2 范数，用于诊断预训练期的嵌入塌缩。
+
+    equiv3 的元素身份有三个入口：`sphere_embedding`（节点级 L=0）、
+    `EdgeDegreeEmbedding` 的 source/target（调制边的 m=0 径向系数）、
+    以及每个 attention block 的 source/target。SCD 论文附录 B 报告不冻结
+    元素嵌入会使其趋近于零；本函数让"是否需要冻结、冻到哪档"可由一次
+    `scd_freeze_element_embedding=none` 的预训练直接读出。
+    """
+    m = model.module if hasattr(model, 'module') else model
+    m = getattr(m, '_orig_mod', m)
+
+    out = {'emb_norm_sphere': float(m.sphere_embedding.weight.norm())}
+
+    edge_norms = [
+        float(emb.weight.norm())
+        for emb in (m.edge_degree_embedding.source_embedding,
+                    m.edge_degree_embedding.target_embedding)
+        if emb is not None
+    ]
+    out['emb_norm_edge_degree'] = sum(edge_norms) / len(edge_norms) if edge_norms else 0.0
+
+    block_norms = [
+        float(emb.weight.norm())
+        for block in m.blocks
+        for emb in (block.ga.source_embedding, block.ga.target_embedding)
+        if emb is not None
+    ]
+    out['emb_norm_blocks'] = sum(block_norms) / len(block_norms) if block_norms else 0.0
+
+    return out
+
+
 @registry.register_trainer("equiformer_v3_dens_trainer")
 class EquiformerV3DeNSTrainer(EquiformerV2ForcesTrainer):
     """
@@ -563,6 +596,11 @@ class EquiformerV3DeNSTrainer(EquiformerV2ForcesTrainer):
                     ]
                     logging.info(", ".join(log_str))
                     self.metrics = {}
+
+                # 元素嵌入范数诊断（按 print_every 节流：每步算 16 次 .norm() + float()
+                # 会引入同样多次 GPU 同步）
+                if self.step % self.config["cmd"]["print_every"] == 0:
+                    log_dict.update(element_embedding_norms(self.model))
 
                 if self.logger is not None:
                     self.logger.log(
