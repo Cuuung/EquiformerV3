@@ -1357,13 +1357,35 @@ def element_embedding_norms(model):
     return out
 ```
 
-在 `EquiformerV3DeNSTrainer.train()` 里，找到既有的 `self.log_dict(train_metrics, sync_dist=True)` 之前（即已按 `print_every` 节流的日志分支内），加入：
+在 `EquiformerV3DeNSTrainer.train()` 的日志段落接入。**实际代码结构（已核对，与本计划早先的描述不同）：**
 
 ```python
-                    train_metrics.update(element_embedding_norms(self.model))
+                # Log metrics.
+                log_dict = {k: self.metrics[k]["metric"] for k in self.metrics}
+                log_dict.update({"lr": ..., "epoch": ..., "step": ...})
+                if (self.step % self.config["cmd"]["print_every"] == 0
+                    or i == 0 or i == (len(self.train_loader) - 1)
+                   ) and distutils.is_master():
+                    log_str = [...]
+                    logging.info(", ".join(log_str))
+                    self.metrics = {}
+
+                if self.logger is not None:
+                    self.logger.log(log_dict, step=self.step, split="train")
 ```
 
-> **实现者注意：** `train()` 中构造 `train_metrics` 并调 `log_dict` 的位置可能不止一处。只加在**已经按 `print_every` 节流**的那一处 —— 每步都算三组范数会拖慢训练。落地前先 `grep -n "log_dict" experimental/trainers/equiformer_v3_dens_trainer.py` 确认。
+`log_dict` 是**每步**构造并送进 `self.logger.log` 的局部变量；被 `print_every` 节流的只有控制台 `logging.info`。没有名为 `train_metrics` 的变量，也没有 `self.log_dict(...)` 方法调用。
+
+因此在**控制台打印块之后、`if self.logger is not None:` 之前**插入按 `print_every` 节流的更新：
+
+```python
+                # 元素嵌入范数诊断（按 print_every 节流：每步算 16 次 .norm() + float()
+                # 会引入同样多次 GPU 同步）
+                if self.step % self.config["cmd"]["print_every"] == 0:
+                    log_dict.update(element_embedding_norms(self.model))
+```
+
+节流是必要的：`element_embedding_norms` 里每个 `float(...)` 都会强制一次 GPU 同步，N@7 配置下有 16 张表。
 
 - [ ] **Step 4: 运行确认通过**
 
