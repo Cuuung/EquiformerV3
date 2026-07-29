@@ -102,13 +102,20 @@ except Exception as e:
     check("模型注册 equiformer_v3_scd", False, repr(e))
     sys.exit(1)
 
-model = build()
+# scd_inject="input": 本文件里这些 v0 遗留用例（早于 scd_inject 概念）依赖 cond
+# 直接加性注入输入嵌入来验证梯度回流；默认值 'adanorm' 下 cond 只经过零初始化
+# 的 AdaNorm 末层，未训练时反传到 cond 生成链路的梯度恒为 0（zero-init 门控的
+# 数学性质，非 bug），因此显式锁定为 'input' 以保留这些用例的原始语义。
+model = build(scd_inject="input")
 
 # ------------------------------------------- 2. 零初始化 => 初始等价于 DeNS
 b = add_noise(make_batch())
 model.train()
 model.dtype, model.device = b.pos.dtype, b.pos.device
-cond = model._scd_cond_embedding(b)
+model_in = build(scd_inject="input")
+model_in.train()
+model_in.dtype, model_in.device = b.pos.dtype, b.pos.device
+cond = model_in._scd_cond_embedding(model_in._scd_cond_vector(b))
 check(
     "零初始化下 cond 恒为 0（初始逐位等价 DeNS，可从 DeNS ckpt 续训）",
     bool(torch.all(cond == 0)),
@@ -233,7 +240,7 @@ o2 = m2(add_noise(make_batch(seed=4)))
 check("纯自条件模式前向可跑", o2["energy"].shape == (2,))
 
 # ------------------------------------------------- 8. 保守力 (gradient) 路径
-m3 = build(direct_prediction=False, regress_stress=True)
+m3 = build(direct_prediction=False, regress_stress=True, scd_inject="input")
 m3.train()
 with torch.no_grad():
     m3.scd_cond_proj.weight.normal_(0, 0.05)
@@ -293,7 +300,7 @@ except Exception as e:
 try:
     torch._dynamo.reset()
     m2 = build(direct_prediction=False, regress_stress=True,
-               enable_compile=True, compile_dynamic=False)
+               enable_compile=True, compile_dynamic=False, scd_inject="input")
     m2.train()
     with torch.no_grad():
         m2.scd_cond_proj.weight.normal_(0, 0.05)
@@ -397,7 +404,10 @@ check("_forward_dens_force_encoding 接受 cond 形参",
       "cond" in params and params["cond"].default is None)
 
 # gradient checkpointing 分支也必须透传 cond
-m_ckpt = build(gradient_checkpointing_block_list=[1, 1])
+# scd_inject="input"：本断言验证的是"新增 cond 形参没有破坏 checkpointing 路径
+# 下的既有 SCD 梯度回流"，而非 AdaNorm 本身的透传（那由下面 Task 4 的用例专门覆盖），
+# 走 input 注入才能在未训练模型上观测到非零梯度。
+m_ckpt = build(gradient_checkpointing_block_list=[1, 1], scd_inject="input")
 m_ckpt.train()
 with torch.no_grad():
     m_ckpt.scd_cond_proj.weight.normal_(0, 0.05)
@@ -408,11 +418,91 @@ nz_ckpt = [
     for n, p in m_ckpt.named_parameters()
     if n.startswith("scd_") and n != "scd_mask_token"
 ]
-# 注：此刻 `_forward_cond` 恒返回 None（`scd_inject` 要到 Task 4 才存在），SCD 走的
-# 仍是 v0 的输入层注入，故本断言验证的是"新增 cond 形参没有破坏 checkpointing 路径
-# 下的既有 SCD 梯度回流"，而非 cond 本身的透传。
 check("gradient checkpointing 路径未被 cond 形参破坏（SCD 梯度仍回流）",
       all(nz_ckpt), f"{sum(nz_ckpt)}/{len(nz_ckpt)}")
+
+# ========================= scd_inject（Task 4） =========================
+for mode in ("input", "adanorm", "both"):
+    mm = build(scd_inject=mode)
+    mm.train()
+    with torch.no_grad():
+        mm.scd_cond_proj.weight.normal_(0, 0.05)
+        for blk in mm.blocks:
+            if getattr(blk, "use_adanorm_1", False):
+                blk.norm_1.fc[-1].weight.normal_(0, 0.05)
+                blk.norm_2.fc[-1].weight.normal_(0, 0.05)
+    o = mm(add_noise(make_batch(seed=60)))
+    o["energy"].sum().backward()
+    check(f"scd_inject={mode}: direct 前向+反传可跑", o["energy"].shape == (2,))
+
+    if mode in ("adanorm", "both"):
+        # 打破 AdaNorm 零初始化后，梯度应能穿过 fc[-1] 回流到条件生成器
+        # （scd_cond_proj / scd_cond_head），而不止是"前向+反传不报错"。
+        proj_nz = bool(
+            mm.scd_cond_proj.weight.grad is not None
+            and mm.scd_cond_proj.weight.grad.abs().sum() > 0
+        )
+        head_nz = all(
+            p.grad is not None and bool(p.grad.abs().sum() > 0)
+            for p in mm.scd_cond_head.parameters()
+        )
+        check(f"scd_inject={mode}: 打破 AdaNorm 零初始化后梯度回流到条件生成器",
+              proj_nz and head_nz)
+
+    mg = build(scd_inject=mode, direct_prediction=False)
+    mg.train()
+    og = mg(add_noise(make_batch(seed=61)))
+    check(f"scd_inject={mode}: 保守力前向可跑", og["forces"].shape == (12, 3))
+
+m_ada = build(scd_inject="adanorm")
+check("scd_inject=adanorm: blocks 建成 AdaNorm",
+      all(b.use_adanorm_1 and b.use_adanorm_2 for b in m_ada.blocks))
+m_in = build(scd_inject="input")
+check("scd_inject=input: blocks 不建 AdaNorm",
+      all(not b.use_adanorm_1 and not b.use_adanorm_2 for b in m_in.blocks))
+
+# identity-init：adanorm 模型未训练调制头时等价于 DeNS
+torch.manual_seed(77)
+m_scd = build(scd_inject="adanorm")
+m_dens_cfg = dict(MODEL_CFG)
+m_dens = registry.get_model_class("equiformer_v3_dens")(**m_dens_cfg).to(DEV)
+shared = {k: v for k, v in m_scd.state_dict().items() if k in m_dens.state_dict()}
+missing, unexpected = m_dens.load_state_dict(shared, strict=False)
+m_scd.eval(); m_dens.eval()
+b_a = add_noise(make_batch(seed=78))
+b_b = add_noise(make_batch(seed=78))
+b_b.pos = b_a.pos.clone(); b_b.pos_clean = b_a.pos_clean.clone()
+b_b.noise_vec = b_a.noise_vec.clone()
+with torch.no_grad():
+    o_scd = m_scd(b_a)
+    o_dens = m_dens(b_b)
+de = (o_scd["energy"] - o_dens["energy"]).abs().max().item()
+check("identity-init: adanorm 模型 == 同权重 DeNS", de < 1e-5, f"max|dE|={de:.2e}")
+
+# adanorm 模式的旋转等变（调制头非零）
+m_eq = build(scd_inject="adanorm")
+with torch.no_grad():
+    m_eq.scd_cond_proj.weight.normal_(0, 0.05)
+    for blk in m_eq.blocks:
+        blk.norm_1.fc[-1].weight.normal_(0, 0.05)
+        blk.norm_1.fc[-1].bias.normal_(0, 0.05)
+        blk.norm_2.fc[-1].weight.normal_(0, 0.05)
+m_eq.eval()
+ba = add_noise(make_batch(seed=79))
+R = rot_mat(ba.pos.dtype)
+bb = add_noise(make_batch(seed=79))
+bb.pos = ba.pos @ R.T
+bb.pos_clean = ba.pos_clean @ R.T
+bb.noise_vec = ba.noise_vec @ R.T
+bb.cell = torch.einsum("bij,kj->bik", ba.cell, R)
+bb.forces = ba.forces @ R.T
+with torch.no_grad():
+    oa = m_eq(ba)
+    ob = m_eq(bb)
+e_err = (oa["energy"] - ob["energy"]).abs().max().item()
+f_err = (oa["forces"] @ R.T - ob["forces"]).abs().max().item()
+check("adanorm: 能量旋转不变", e_err < 1e-4, f"max|dE|={e_err:.2e}")
+check("adanorm: 力旋转等变", f_err < 1e-4, f"max|dF|={f_err:.2e}")
 
 print()
 if FAILURES:

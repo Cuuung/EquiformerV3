@@ -19,6 +19,7 @@ import torch
 from fairchem.core.common.registry import registry
 
 from .equiformer_v3_dens import EquiformerV3DeNS_OC
+from .transformer_block import TransBlockV3
 
 
 class SCDCondHead(torch.nn.Module):
@@ -58,6 +59,13 @@ class EquiformerV3SCD_OC(EquiformerV3DeNS_OC):
                                 纯自条件去噪（此时 `force_embedding` 被移除，避免
                                 DDP unused-parameter 报错；从 DeNS ckpt 续训需
                                 `strict=False`）。
+        scd_inject (str):       条件向量的注入方式：'input' 只走 v0 的输入层加法；
+                                'adanorm' 只走 v1 的 AdaNorm（blocks 会被重建）；
+                                'both' 两者叠加，但只算一次 cond。
+        scd_adanorm_targets (tuple): `scd_inject` 含 adanorm 时，哪些 pre-norm
+                                换成 AdaNorm，见 `TransBlockV3`。
+        scd_adanorm_scope (str): 见 `EquivariantAdaNorm`。
+        scd_adanorm_use_node_feat (bool): 见 `EquivariantAdaNorm`。
         scd_p_dropcond (float): 按图丢弃条件向量、替换为可学 mask token 的概率。
         scd_cond_clip (float):  条件向量的数值截断，对齐 SCD 原实现的稳定性处理。
         scd_detach_cond (bool): True 时切断 clean 前向的梯度（省一次 backward，
@@ -70,12 +78,18 @@ class EquiformerV3SCD_OC(EquiformerV3DeNS_OC):
         self,
         use_scd=True,
         use_force_cond=True,
+        scd_inject='adanorm',
+        scd_adanorm_targets=('attn', 'ffn'),
+        scd_adanorm_scope='per_degree',
+        scd_adanorm_use_node_feat=True,
         scd_p_dropcond=0.2,
         scd_cond_clip=100.0,
         scd_detach_cond=False,
         **kwargs,
     ):
         super().__init__(**kwargs)
+        assert scd_inject in ('input', 'adanorm', 'both'), f"unknown scd_inject: {scd_inject}"
+        self.scd_inject = scd_inject
 
         self.use_scd = use_scd
         self.use_force_cond = use_force_cond
@@ -91,6 +105,13 @@ class EquiformerV3SCD_OC(EquiformerV3DeNS_OC):
         self.scd_cond_norm = torch.nn.LayerNorm(self.num_channels)
         self.scd_cond_proj = torch.nn.Linear(self.num_channels, self.num_channels)
 
+        if self.use_scd and self.scd_inject in ('adanorm', 'both'):
+            self._rebuild_blocks_with_adanorm(
+                targets=tuple(scd_adanorm_targets),
+                scope=scd_adanorm_scope,
+                use_node_feat=scd_adanorm_use_node_feat,
+            )
+
         self.apply(self._init_weights)
         torch.nn.init.xavier_uniform_(self.scd_mask_token)
         # 零初始化：初始状态下 SCD 分支恒输出 0，与父类 DeNS 逐位一致，
@@ -103,6 +124,25 @@ class EquiformerV3SCD_OC(EquiformerV3DeNS_OC):
         no_wd_list = super().no_weight_decay()
         no_wd_list.add("scd_mask_token")
         return no_wd_list
+
+    def _rebuild_blocks_with_adanorm(self, targets, scope, use_node_feat):
+        """在父类的 block 参数表上做增量，把两处 pre-norm 换成 AdaNorm。
+
+        父类 `__init__` 已建好 `self.blocks`，这里按同一份配置重建并追加
+        AdaNorm 相关参数。重建发生在 `self.apply(self._init_weights)` 之前，
+        因此新模块同样会被正常初始化。
+        """
+        new_blocks = torch.nn.ModuleList()
+        for i in range(self.num_layers):
+            cfg = self._build_block_config(i)
+            cfg.update(
+                cond_channels=self.num_channels,
+                adanorm_targets=targets,
+                adanorm_scope=scope,
+                adanorm_use_node_feat=use_node_feat,
+            )
+            new_blocks.append(TransBlockV3(**cfg))
+        self.blocks = new_blocks
 
     def _scd_clean_cond(self, data, num_graphs):
         """在未加噪结构上跑一次前向，得到每构型的条件向量 [B, C]。
@@ -139,14 +179,12 @@ class EquiformerV3SCD_OC(EquiformerV3DeNS_OC):
         )
         return self.scd_cond_head(x_scalar, data.batch, num_graphs)
 
-    def _scd_cond_embedding(self, data):
-        """返回加到输入嵌入上的条件项 [N, (lmax+1)^2, C]（只占 L=0 通道）。"""
+    def _scd_cond_vector(self, data):
+        """节点级条件向量 [N, C]，或 None（未启用 SCD）。"""
+        if not self.use_scd:
+            return None
         num_graphs = len(data.natoms)
-        do_self_cond = (
-            self.use_scd
-            and self.training
-            and getattr(data, "denoising_pos_forward", False)
-        )
+        do_self_cond = self.training and getattr(data, "denoising_pos_forward", False)
 
         if do_self_cond:
             c = self._scd_clean_cond(data, num_graphs)
@@ -158,26 +196,31 @@ class EquiformerV3SCD_OC(EquiformerV3DeNS_OC):
                 ).to(c.dtype).view(-1, 1)
                 c = c * keep + self.scd_mask_token * (1.0 - keep)
         else:
-            # 微调 / 推理：无条件路径，单次前向
             c = self.scd_mask_token.expand(num_graphs, -1)
 
         c = self.scd_cond_norm(c)
         c = c.clamp(min=-self.scd_cond_clip, max=self.scd_cond_clip)
         c = self.scd_cond_proj(c)
-        c = c[data.batch]
+        return c[data.batch]
 
+    def _forward_cond(self, data):
+        """AdaNorm 用的 cond；inject 不含 adanorm 时返回 None。"""
+        if self.scd_inject not in ('adanorm', 'both'):
+            return None
+        return self._scd_cond_vector(data)
+
+    def _scd_cond_embedding(self, cond_nodes):
+        """把节点级条件写进 L=0，得到可加到输入嵌入上的 [N, (lmax+1)^2, C]。"""
         cond_embedding = torch.zeros(
-            (c.shape[0], (self.lmax + 1) ** 2, self.num_channels),
-            device=c.device,
-            dtype=c.dtype,
+            (cond_nodes.shape[0], (self.lmax + 1) ** 2, self.num_channels),
+            device=cond_nodes.device,
+            dtype=cond_nodes.dtype,
         )
-        cond_embedding[:, 0, :] = c
+        cond_embedding[:, 0, :] = cond_nodes
         return cond_embedding
 
     def _forward_dens_force_encoding(self, data, cond=None):
-        """在 DeNS 的输入条件上叠加 SCD 自条件。
-
-        v0 走输入层注入，`cond`（AdaNorm 用的节点级条件）此处未用到。
+        """在 DeNS 的输入条件上叠加 SCD 自条件（`scd_inject` 含 input/both 时）。
 
         三条前向路径（direct / gradient / compiled）都只通过本方法拿
         `force_embedding` 再传进 `core_compute`，所以这里叠加即可，无需改动它们。
@@ -201,7 +244,10 @@ class EquiformerV3SCD_OC(EquiformerV3DeNS_OC):
             force_embedding = torch.zeros((), dtype=self.dtype, device=self.device)
             noise_mask_tensor = noise_mask_tensor.view(-1, 1)
 
-        force_embedding = force_embedding + self._scd_cond_embedding(data)
+        if self.use_scd and self.scd_inject in ('input', 'both'):
+            # adanorm 分支已经算过 cond，直接复用，避免第二次 clean 前向
+            cond_nodes = cond if cond is not None else self._scd_cond_vector(data)
+            force_embedding = force_embedding + self._scd_cond_embedding(cond_nodes)
 
         return (
             force_embedding,
