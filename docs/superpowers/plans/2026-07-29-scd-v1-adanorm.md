@@ -1541,9 +1541,17 @@ drop_path_rate 0.05 -> 0.1（论文 Table 17，双前向）。"
 
 ---
 
-### Task 9: 编译路径 × adanorm 验证
+### Task 9（可选，不阻塞）: 编译路径 × adanorm 验证
 
 **前置：** Task 8 的 eager 验证已全绿。本 task 覆盖 spec §5.6。
+
+> **降级说明：** v1 的交付目标是 **eager/fp32**，编译路径不在交付路径上。
+> SCD 本身不引入二阶反传 —— make_fx 只服务于保守力，与自条件无关；Task 3 之所以
+>改到编译区，纯粹是 `core_compute` 签名波及既有调用点，且不接线会导致
+> 「SCD-adanorm + 保守力 + enable_compile」下条件被静默丢弃（比崩掉更糟）。
+> Task 3 的 30/30（含四段编译测试）已证明**无条件路径**未被弄坏；本 task 要补的是
+> **adanorm 在编译下**的行为，属于将来真开编译时才需要的验证。
+> **不计入完成标准**，可在 Task 8 之后择机执行。
 
 **Files:**
 - Modify: `experimental/tests/test_equiformer_v3_scd.py`（现有 A/B/C/D 四段编译测试）
@@ -1614,7 +1622,7 @@ git commit -m "SCD v1: 编译路径 × adanorm 验证
 - [ ] 四档冻结的参数计数精确匹配
 - [ ] gradient checkpointing 下 cond 正确透传
 - [ ] 配置可实例化且 `use_compile: False`
-- [ ] （Task 9）四段编译测试对 `input` / `adanorm` 两种模式均通过
+- [ ] ~~（Task 9）四段编译测试对 `input` / `adanorm` 两种模式均通过~~ —— 已降级为可选，不阻塞
 
 ## 已知遗留（不在本计划范围）
 
