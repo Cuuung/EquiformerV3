@@ -504,6 +504,39 @@ f_err = (oa["forces"] @ R.T - ob["forces"]).abs().max().item()
 check("adanorm: 能量旋转不变", e_err < 1e-4, f"max|dE|={e_err:.2e}")
 check("adanorm: 力旋转等变", f_err < 1e-4, f"max|dF|={f_err:.2e}")
 
+# ===================== 元素嵌入冻结四档（Task 5） =====================
+# MODEL_CFG: num_channels=32, edge_channels=32, max_num_elements=128, num_layers=2
+#   sphere        = 128*32                     = 4096
+#   edge_degree   = 2*128*32                   = 8192   -> 累计 12288
+#   blocks(2 层)  = 2*2*128*32                 = 16384  -> 累计 28672
+EXPECTED_FROZEN = {"none": 0, "sphere": 4096, "sphere_edge": 12288, "all": 28672}
+
+for level, expected in EXPECTED_FROZEN.items():
+    mf = build(scd_freeze_element_embedding=level)
+    frozen = sum(p.numel() for p in mf.parameters() if not p.requires_grad)
+    check(f"冻结档 {level}: 冻结参数数 == {expected}", frozen == expected, f"实际 {frozen}")
+
+# 冻结后仍能前向+反传，且所有 requires_grad=True 的参数都进图
+# 注：MODEL_CFG 是 direct_prediction，force_block/dens_block/stress_block 是与
+# energy 分支并列的独立输出头，只从各自的 loss 项拿梯度，故须用 energy+forces+
+# stress 三项合成 loss（对齐真实训练的多任务 loss），否则即便不冻结任何东西
+# 这些头也不会进图，这不是冻结逻辑的问题。
+mf = build(scd_freeze_element_embedding="all")
+mf.train()
+with torch.no_grad():
+    mf.scd_cond_proj.weight.normal_(0, 0.05)
+of = mf(add_noise(make_batch(seed=70)))
+loss = of["energy"].sum() + of["forces"].sum() + of["stress"].sum()
+loss.backward()
+no_grad_names = [
+    n for n, p in mf.named_parameters() if p.requires_grad and p.grad is None
+]
+check("冻结 all 后 DDP unused-param 安全", not no_grad_names, f"{no_grad_names[:3]}")
+
+mt = build(scd_freeze_mask_token=True)
+check("scd_freeze_mask_token=True 冻住 mask token",
+      not mt.scd_mask_token.requires_grad)
+
 print()
 if FAILURES:
     print(f"FAILED: {len(FAILURES)} -> {FAILURES}")

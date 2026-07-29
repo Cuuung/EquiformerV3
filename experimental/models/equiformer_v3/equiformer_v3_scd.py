@@ -70,9 +70,14 @@ class EquiformerV3SCD_OC(EquiformerV3DeNS_OC):
         scd_cond_clip (float):  条件向量的数值截断，对齐 SCD 原实现的稳定性处理。
         scd_detach_cond (bool): True 时切断 clean 前向的梯度（省一次 backward，
                                 但与论文不一致，论文让梯度回流 clean 前向）。
+        scd_freeze_element_embedding (str): 冻结输入侧元素嵌入的档位，见
+                                `_apply_element_embedding_freeze`。
+        scd_freeze_mask_token (bool): 是否额外冻结 `scd_mask_token`。
 
     其余参数见 `EquiformerV3DeNS_OC`。
     """
+
+    _FREEZE_LEVELS = ('none', 'sphere', 'sphere_edge', 'all')
 
     def __init__(
         self,
@@ -85,6 +90,8 @@ class EquiformerV3SCD_OC(EquiformerV3DeNS_OC):
         scd_p_dropcond=0.2,
         scd_cond_clip=100.0,
         scd_detach_cond=False,
+        scd_freeze_element_embedding='none',
+        scd_freeze_mask_token=False,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -96,6 +103,8 @@ class EquiformerV3SCD_OC(EquiformerV3DeNS_OC):
         self.scd_p_dropcond = scd_p_dropcond
         self.scd_cond_clip = scd_cond_clip
         self.scd_detach_cond = scd_detach_cond
+        self.scd_freeze_element_embedding = scd_freeze_element_embedding
+        self.scd_freeze_mask_token = scd_freeze_mask_token
 
         if not self.use_force_cond:
             self.force_embedding = None
@@ -119,11 +128,46 @@ class EquiformerV3SCD_OC(EquiformerV3DeNS_OC):
         torch.nn.init.constant_(self.scd_cond_proj.weight, 0.0)
         torch.nn.init.constant_(self.scd_cond_proj.bias, 0.0)
 
+        self._apply_element_embedding_freeze()
+
     @torch.jit.ignore
     def no_weight_decay(self):
         no_wd_list = super().no_weight_decay()
         no_wd_list.add("scd_mask_token")
         return no_wd_list
+
+    def _apply_element_embedding_freeze(self):
+        """按档位冻结输入侧元素嵌入。
+
+        论文附录 B：预训练不冻结元素嵌入会让其趋近于零，导致下游不稳定。
+        equiv3 的元素身份有三个入口（sphere / edge-degree / 每个 attention
+        block），故分四档。**输出头（force/dens/stress block）不在冻结范围内**
+        —— 它们是任务头而非输入通道，SSL 预训练时 dens_block 正是被训练的头。
+        """
+        level = self.scd_freeze_element_embedding
+        assert level in self._FREEZE_LEVELS, f"unknown freeze level: {level}"
+
+        if self.scd_freeze_mask_token:
+            self.scd_mask_token.requires_grad_(False)
+
+        if level == 'none':
+            return
+
+        self.sphere_embedding.weight.requires_grad_(False)
+        if level == 'sphere':
+            return
+
+        for emb in (self.edge_degree_embedding.source_embedding,
+                    self.edge_degree_embedding.target_embedding):
+            if emb is not None:
+                emb.weight.requires_grad_(False)
+        if level == 'sphere_edge':
+            return
+
+        for block in self.blocks:
+            for emb in (block.ga.source_embedding, block.ga.target_embedding):
+                if emb is not None:
+                    emb.weight.requires_grad_(False)
 
     def _rebuild_blocks_with_adanorm(self, targets, scope, use_node_feat):
         """在父类的 block 参数表上做增量，把两处 pre-norm 换成 AdaNorm。
