@@ -291,47 +291,7 @@ class EquiformerV3_OC(torch.nn.Module, GraphModelMixin):
         # Transformer block
         self.blocks = torch.nn.ModuleList()
         for i in range(self.num_layers):
-            if self.gradient_checkpointing_block_list[i] == 1:
-                attn_activation = self.attn_activation.replace('_mem', '')
-                ffn_activation  = self.ffn_activation.replace('_mem', '')
-            else:
-                attn_activation = self.attn_activation
-                ffn_activation  = self.ffn_activation
-            block_config_dict = dict(
-                num_in_channels=self.num_channels,
-                attn_hidden_channels=self.attn_hidden_channels,
-                num_heads=self.num_heads,
-                attn_alpha_channels=self.attn_alpha_channels,
-                attn_value_channels=self.attn_value_channels,
-                ffn_hidden_channels=self.ffn_hidden_channels,
-                num_out_channels=self.num_channels,
-                lmax=self.lmax,
-                mmax=self.mmax,
-                so3_rotation=self.so3_rotation,
-                attn_grid_resolution_list=self.attn_grid_resolution_list,
-                ffn_grid_resolution_list=self.ffn_grid_resolution_list,
-                max_num_elements=self.max_num_elements,
-                edge_channels_list=self.edge_channels_list,
-                use_atom_edge_embedding=self.use_atom_edge_embedding,
-                attn_activation=attn_activation,
-                use_attn_renorm=self.use_attn_renorm,
-                use_add_merge=self.use_add_merge,
-                use_rad_l_parametrization=self.use_rad_l_parametrization,
-                softcap=self.softcap,
-                attn_eps=self.attn_eps,
-                ffn_activation=ffn_activation,
-                use_grid_mlp=self.use_grid_mlp,
-                norm_type=self.norm_type,
-                alpha_drop=self.alpha_drop,
-                attn_mask_rate=self.attn_mask_rate,
-                attn_weights_drop=attn_weights_drop,
-                value_drop=self.value_drop,
-                drop_path_rate=self.drop_path_rate,
-                proj_drop=self.proj_drop,
-                ffn_drop=self.ffn_drop
-            )
-            block_class = TransBlockV3
-            self.blocks.append(block_class(**block_config_dict))
+            self.blocks.append(TransBlockV3(**self._build_block_config(i)))
 
         # Output blocks for energy and forces (and optionally stress)
         self.norm = get_normalization_layer(
@@ -396,6 +356,53 @@ class EquiformerV3_OC(torch.nn.Module, GraphModelMixin):
         self._compiled_core = None
         self._compiled_region = None
         self.use_amp = use_amp
+
+
+    def _build_block_config(self, i):
+        """第 i 个 TransBlockV3 的构造参数。
+
+        抽成方法以便子类（如 SCD 的 AdaNorm 变体）在同一份参数表上做增量，
+        不必复制整张表。
+        """
+        if self.gradient_checkpointing_block_list[i] == 1:
+            attn_activation = self.attn_activation.replace('_mem', '')
+            ffn_activation  = self.ffn_activation.replace('_mem', '')
+        else:
+            attn_activation = self.attn_activation
+            ffn_activation  = self.ffn_activation
+        return dict(
+            num_in_channels=self.num_channels,
+            attn_hidden_channels=self.attn_hidden_channels,
+            num_heads=self.num_heads,
+            attn_alpha_channels=self.attn_alpha_channels,
+            attn_value_channels=self.attn_value_channels,
+            ffn_hidden_channels=self.ffn_hidden_channels,
+            num_out_channels=self.num_channels,
+            lmax=self.lmax,
+            mmax=self.mmax,
+            so3_rotation=self.so3_rotation,
+            attn_grid_resolution_list=self.attn_grid_resolution_list,
+            ffn_grid_resolution_list=self.ffn_grid_resolution_list,
+            max_num_elements=self.max_num_elements,
+            edge_channels_list=self.edge_channels_list,
+            use_atom_edge_embedding=self.use_atom_edge_embedding,
+            attn_activation=attn_activation,
+            use_attn_renorm=self.use_attn_renorm,
+            use_add_merge=self.use_add_merge,
+            use_rad_l_parametrization=self.use_rad_l_parametrization,
+            softcap=self.softcap,
+            attn_eps=self.attn_eps,
+            ffn_activation=ffn_activation,
+            use_grid_mlp=self.use_grid_mlp,
+            norm_type=self.norm_type,
+            alpha_drop=self.alpha_drop,
+            attn_mask_rate=self.attn_mask_rate,
+            attn_weights_drop=self.attn_weights_drop,
+            value_drop=self.value_drop,
+            drop_path_rate=self.drop_path_rate,
+            proj_drop=self.proj_drop,
+            ffn_drop=self.ffn_drop
+        )
 
 
     def _forward_edge(
