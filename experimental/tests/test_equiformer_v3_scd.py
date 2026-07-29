@@ -559,6 +559,55 @@ try:
 except AssertionError:
     check("非法档位应报错", True)
 
+# ================= clean 前向正则化噪声（Task 6） =================
+# 默认 0 时 clean 坐标必须保持不变（reg noise 是 out-of-place 的，不污染 batch）
+m0 = build(scd_reg_noise_std=0.0)
+m0.train()
+b0 = add_noise(make_batch(seed=81))
+before = b0.pos_clean.clone()
+m0(b0)
+check("scd_reg_noise_std=0: pos_clean 不被修改",
+      torch.equal(b0.pos_clean, before))
+
+# reg noise 开启时 pos_clean 同样不该被就地改写
+mr0 = build(scd_reg_noise_std=0.05)
+mr0.train()
+br0 = add_noise(make_batch(seed=83))
+before_r = br0.pos_clean.clone()
+mr0(br0)
+check("scd_reg_noise_std>0: pos_clean 仍不被就地改写",
+      torch.equal(br0.pos_clean, before_r))
+
+# 关掉 dropcond 以隔离变量：条件向量的差异必须只来自 reg noise
+bq = add_noise(make_batch(seed=82))
+m_on = build(scd_reg_noise_std=0.05, scd_p_dropcond=0.0)
+m_off = build(scd_reg_noise_std=0.0, scd_p_dropcond=0.0)
+m_on.train()
+m_off.train()
+# 直接调 _scd_cond_vector（不经 forward()）时 self.dtype/self.device 尚未被
+# forward() 的开头两行设置，须手动补上，对齐上面 model.dtype/model.device 的用法。
+m_on.dtype, m_on.device = bq.pos.dtype, bq.pos.device
+m_off.dtype, m_off.device = bq.pos.dtype, bq.pos.device
+# scd_cond_proj 零初始化会让 cond 恒为 0，掩盖 reg noise 的影响，须先打破
+# （同上文"打破零初始化"用法），否则本组断言无论实现对错都会通过。
+with torch.no_grad():
+    m_on.scd_cond_proj.weight.normal_(0, 0.05)
+    m_off.scd_cond_proj.weight.normal_(0, 0.05)
+
+torch.manual_seed(1)
+a1 = m_on._scd_cond_vector(bq)
+torch.manual_seed(2)
+a2 = m_on._scd_cond_vector(bq)
+check("reg noise 开: 两次 clean 前向的条件不同",
+      not torch.allclose(a1, a2, atol=1e-6))
+
+torch.manual_seed(1)
+c1 = m_off._scd_cond_vector(bq)
+torch.manual_seed(2)
+c2 = m_off._scd_cond_vector(bq)
+check("对照组 reg noise 关: 两次 clean 前向的条件相同",
+      torch.allclose(c1, c2, atol=1e-6))
+
 print()
 if FAILURES:
     print(f"FAILED: {len(FAILURES)} -> {FAILURES}")

@@ -73,6 +73,8 @@ class EquiformerV3SCD_OC(EquiformerV3DeNS_OC):
         scd_freeze_element_embedding (str): 冻结输入侧元素嵌入的档位，见
                                 `_apply_element_embedding_freeze`。
         scd_freeze_mask_token (bool): 是否额外冻结 `scd_mask_token`。
+        scd_reg_noise_std (float): clean 前向输入上的正则化噪声标准差（论文附录
+                                A.1，sigma~0.005）。默认 0 关闭，见类文档。
 
     其余参数见 `EquiformerV3DeNS_OC`。
     """
@@ -92,6 +94,7 @@ class EquiformerV3SCD_OC(EquiformerV3DeNS_OC):
         scd_detach_cond=False,
         scd_freeze_element_embedding='none',
         scd_freeze_mask_token=False,
+        scd_reg_noise_std=0.0,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -105,6 +108,7 @@ class EquiformerV3SCD_OC(EquiformerV3DeNS_OC):
         self.scd_detach_cond = scd_detach_cond
         self.scd_freeze_element_embedding = scd_freeze_element_embedding
         self.scd_freeze_mask_token = scd_freeze_mask_token
+        self.scd_reg_noise_std = scd_reg_noise_std
 
         if not self.use_force_cond:
             self.force_embedding = None
@@ -200,6 +204,12 @@ class EquiformerV3SCD_OC(EquiformerV3DeNS_OC):
             if hasattr(data, "pos_clean")
             else data.pos - data.noise_vec
         )
+        # 论文附录 A.1 的 regularizing noise（sigma ~ 0.005）：只加在未腐蚀视图上。
+        # 注意参考实现仅在 noise_in_loader=False 分支施加，其周期材料配置
+        # （pretrain_amp20.yaml, noise_in_loader=True）实际未启用，故默认 0。
+        # out-of-place：pos_clean 是新张量，不写回 data.pos_clean，不污染 batch。
+        if self.scd_reg_noise_std > 0.0 and self.training:
+            pos_clean = pos_clean + torch.randn_like(pos_clean) * self.scd_reg_noise_std
         pos_noisy = data.pos
         data.pos = pos_clean
         try:
