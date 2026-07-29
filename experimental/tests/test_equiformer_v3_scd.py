@@ -516,6 +516,22 @@ for level, expected in EXPECTED_FROZEN.items():
     frozen = sum(p.numel() for p in mf.parameters() if not p.requires_grad)
     check(f"冻结档 {level}: 冻结参数数 == {expected}", frozen == expected, f"实际 {frozen}")
 
+# 身份级检查：edge_degree_embedding / blocks[i].ga / force_block / dens_block 的
+# source/target_embedding 形状完全相同（同一份 edge_channels_list），仅凭上面的
+# 冻结总数无法区分"冻对了模块"还是"冻错了模块但数量凑巧相等"。force_block /
+# dens_block 是输出头，不在冻结范围内，all 档下必须仍可训练。
+# （stress_block 是 FeedForwardNetworkStressHead，没有 source/target_embedding，不检查。）
+mf_all = build(scd_freeze_element_embedding="all")
+for head_name in ("force_block", "dens_block"):
+    head = getattr(mf_all, head_name)
+    for emb_name in ("source_embedding", "target_embedding"):
+        emb = getattr(head, emb_name)
+        if emb is None:
+            check(f"{head_name}.{emb_name} 为 None（use_atom_edge_embedding=False，符合预期）", True)
+        else:
+            check(f"all 档下 {head_name}.{emb_name} 仍可训练（输出头不在冻结范围）",
+                  emb.weight.requires_grad)
+
 # 冻结后仍能前向+反传，且所有 requires_grad=True 的参数都进图
 # 注：MODEL_CFG 是 direct_prediction，force_block/dens_block/stress_block 是与
 # energy 分支并列的独立输出头，只从各自的 loss 项拿梯度，故须用 energy+forces+
@@ -536,6 +552,12 @@ check("冻结 all 后 DDP unused-param 安全", not no_grad_names, f"{no_grad_na
 mt = build(scd_freeze_mask_token=True)
 check("scd_freeze_mask_token=True 冻住 mask token",
       not mt.scd_mask_token.requires_grad)
+
+try:
+    build(scd_freeze_element_embedding="bogus")
+    check("非法档位应报错", False, "未抛异常")
+except AssertionError:
+    check("非法档位应报错", True)
 
 print()
 if FAILURES:
