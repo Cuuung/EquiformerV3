@@ -462,7 +462,8 @@ class EquiformerV3_OC(torch.nn.Module, GraphModelMixin):
         edge_distance, 
         edge_index,
         edge_envelope_weight,
-        batch
+        batch,
+        cond=None,
     ):
         # bf16 混合精度（DPA4 式，roadmap §7）：autocast 只包交互块；几何/边特征已在
         # fp32 算好，留在区外。仅训练+CUDA+开关时生效。末层 norm 自带
@@ -488,6 +489,7 @@ class EquiformerV3_OC(torch.nn.Module, GraphModelMixin):
                         edge_index,
                         edge_envelope_weight,
                         batch,     # for GraphDropPath
+                        cond,      # for SCD AdaNorm
                     )
                 elif self.gradient_checkpointing_block_list[i] == 1:
                     x = torch.utils.checkpoint.checkpoint(
@@ -499,6 +501,7 @@ class EquiformerV3_OC(torch.nn.Module, GraphModelMixin):
                         edge_index,
                         edge_envelope_weight,
                         batch,     # for GraphDropPath
+                        cond,      # for SCD AdaNorm
                         use_reentrant=False
                     )
                 else:
@@ -521,6 +524,7 @@ class EquiformerV3_OC(torch.nn.Module, GraphModelMixin):
         edge_distance_vec,
         edge_index,
         batch,
+        cond=None,
     ):
         """Pure tensor-in / tensor-out compute body.
 
@@ -543,6 +547,7 @@ class EquiformerV3_OC(torch.nn.Module, GraphModelMixin):
             edge_index,
             edge_envelope_weight,
             batch,
+            cond,
         )
         return x_scalar, x, edge_distance, edge_envelope_weight
 
@@ -581,6 +586,7 @@ class EquiformerV3_OC(torch.nn.Module, GraphModelMixin):
             edge_distance_vec,
             edge_index,
             data.batch,
+            None,      # 基类无条件；显式传入以免编译区把默认值烤成常量
         )
 
         outputs = {}
@@ -772,7 +778,7 @@ class EquiformerV3_OC(torch.nn.Module, GraphModelMixin):
         energy_block = self.energy_block
         avg_num_nodes = self.avg_num_nodes
 
-        def _energy(pos_p, cell_p, an, ei, co, batch, n_sys):
+        def _energy(pos_p, cell_p, an, ei, co, batch, n_sys, cond):
             # symbolic-safe forms (identical numerics for dynamic=False, required
             # for dynamic=True): index_select instead of advanced indexing (the
             # latter silently truncates the 2nd-order grad under symbolic trace),
@@ -783,20 +789,20 @@ class EquiformerV3_OC(torch.nn.Module, GraphModelMixin):
             shifts = torch.einsum("ej,ejk->ek", co, cell_e)
             edv = pos_p.index_select(0, src) - pos_p.index_select(0, dst) + shifts
             ed = torch.linalg.norm(edv, dim=-1)
-            x_scalar, _x, _, _ = self.core_compute(an, ed, edv, ei, batch)
+            x_scalar, _x, _, _ = self.core_compute(an, ed, edv, ei, batch, cond)
             node_e = energy_block(x_scalar).view(-1)
             energy = torch.zeros(n_sys, device=node_e.device, dtype=node_e.dtype)
             energy.index_add_(0, batch, node_e)
             energy = energy / avg_num_nodes
             return energy
 
-        def core_fn_stress(pos, disp, an, ei, co, cell, batch):
+        def core_fn_stress(pos, disp, an, ei, co, cell, batch, cond=None):
             sym = 0.5 * (disp + disp.transpose(-1, -2))
             pos_p = pos + torch.bmm(
                 pos.unsqueeze(-2), torch.index_select(sym, 0, batch)
             ).squeeze(-2)
             cell_p = cell + torch.bmm(cell, sym)
-            energy = _energy(pos_p, cell_p, an, ei, co, batch, cell.shape[0])
+            energy = _energy(pos_p, cell_p, an, ei, co, batch, cell.shape[0], cond)
             grads = torch.autograd.grad([energy.sum()], [pos, disp], create_graph=True)
             forces = torch.neg(grads[0])
             virial = grads[1].view(-1, 3, 3)
@@ -804,8 +810,8 @@ class EquiformerV3_OC(torch.nn.Module, GraphModelMixin):
             stress = (virial / volume.view(-1, 1, 1)).view(-1, 9)
             return energy, forces, stress
 
-        def core_fn_force(pos, an, ei, co, cell, batch):
-            energy = _energy(pos, cell, an, ei, co, batch, cell.shape[0])
+        def core_fn_force(pos, an, ei, co, cell, batch, cond=None):
+            energy = _energy(pos, cell, an, ei, co, batch, cell.shape[0], cond)
             forces = torch.neg(
                 torch.autograd.grad(energy.sum(), pos, create_graph=True)[0]
             )
@@ -835,8 +841,10 @@ class EquiformerV3_OC(torch.nn.Module, GraphModelMixin):
             ).requires_grad_(True)
             energy, forces, stress = self._compiled_region(
                 core_fn_stress,
-                (pos, disp, an, ei, co, cell, batch),
-                trace_example=make_prime_graph_example(pos.device, dtype, stress=True)
+                (pos, disp, an, ei, co, cell, batch, None),
+                # cond 恒占一个 traced 入参位（fx 的 concrete_args 个数必须与形参个数
+                # 相等），基类恒为 None，被当常量烤进图。
+                trace_example=(*make_prime_graph_example(pos.device, dtype, stress=True), None)
                 if dyn else None,
                 dynamic_dims=[(pos, [0]), (disp, [0]), (an, [0]), (ei, [1]),
                               (co, [0]), (cell, [0]), (batch, [0])] if dyn else None,
@@ -847,8 +855,8 @@ class EquiformerV3_OC(torch.nn.Module, GraphModelMixin):
         elif self.regress_forces:
             energy, forces = self._compiled_region(
                 core_fn_force,
-                (pos, an, ei, co, cell, batch),
-                trace_example=make_prime_graph_example(pos.device, dtype, stress=False)
+                (pos, an, ei, co, cell, batch, None),
+                trace_example=(*make_prime_graph_example(pos.device, dtype, stress=False), None)
                 if dyn else None,
                 dynamic_dims=[(pos, [0]), (an, [0]), (ei, [1]), (co, [0]),
                               (cell, [0]), (batch, [0])] if dyn else None,

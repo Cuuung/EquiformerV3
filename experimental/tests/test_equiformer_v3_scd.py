@@ -375,6 +375,45 @@ try:
 except Exception as e:
     check("D/plain_compile", False, f"{type(e).__name__}: {str(e)[:300]}")
 
+# ========================= cond 透传（Task 3） =========================
+import inspect
+from fairchem.experimental.models.equiformer_v3.equiformer_v3 import EquiformerV3_OC
+from fairchem.experimental.models.equiformer_v3.equiformer_v3_dens import EquiformerV3DeNS_OC
+
+for fn, name in [
+    (EquiformerV3_OC._forward_blocks, "_forward_blocks"),
+    (EquiformerV3_OC.core_compute, "EquiformerV3_OC.core_compute"),
+    (EquiformerV3DeNS_OC.core_compute, "DeNS.core_compute"),
+]:
+    params = inspect.signature(fn).parameters
+    check(f"{name} 有 cond 形参且默认 None",
+          "cond" in params and params["cond"].default is None)
+
+check("DeNS 有 _forward_cond 钩子且默认返回 None",
+      EquiformerV3DeNS_OC._forward_cond(None, None) is None)
+
+params = inspect.signature(EquiformerV3DeNS_OC._forward_dens_force_encoding).parameters
+check("_forward_dens_force_encoding 接受 cond 形参",
+      "cond" in params and params["cond"].default is None)
+
+# gradient checkpointing 分支也必须透传 cond
+m_ckpt = build(gradient_checkpointing_block_list=[1, 1])
+m_ckpt.train()
+with torch.no_grad():
+    m_ckpt.scd_cond_proj.weight.normal_(0, 0.05)
+o_ckpt = m_ckpt(add_noise(make_batch(seed=51)))
+o_ckpt["energy"].sum().backward()
+nz_ckpt = [
+    bool(p.grad is not None and p.grad.abs().sum() > 0)
+    for n, p in m_ckpt.named_parameters()
+    if n.startswith("scd_") and n != "scd_mask_token"
+]
+# 注：此刻 `_forward_cond` 恒返回 None（`scd_inject` 要到 Task 4 才存在），SCD 走的
+# 仍是 v0 的输入层注入，故本断言验证的是"新增 cond 形参没有破坏 checkpointing 路径
+# 下的既有 SCD 梯度回流"，而非 cond 本身的透传。
+check("gradient checkpointing 路径未被 cond 形参破坏（SCD 梯度仍回流）",
+      all(nz_ckpt), f"{sum(nz_ckpt)}/{len(nz_ckpt)}")
+
 print()
 if FAILURES:
     print(f"FAILED: {len(FAILURES)} -> {FAILURES}")

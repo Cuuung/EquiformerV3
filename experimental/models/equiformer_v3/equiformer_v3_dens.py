@@ -268,6 +268,15 @@ class EquiformerV3DeNS_OC(EquiformerV3_OC):
         self.apply(self._init_weights)
 
 
+    def _forward_cond(self, data):
+        """SCD 的节点级条件向量，[N, C] 或 None。
+
+        基类恒返回 None（DeNS 无自条件）；`EquiformerV3SCD_OC` 覆写。
+        显式返回值而非模块状态，是为了让 `cond` 能作为编译区的显式入参。
+        """
+        return None
+
+
     def core_compute(
         self,
         atomic_numbers,
@@ -276,6 +285,7 @@ class EquiformerV3DeNS_OC(EquiformerV3_OC):
         edge_index,
         batch,
         force_embedding,
+        cond=None,
     ):
         """Pure tensor-in / tensor-out compute body (DeNS variant).
 
@@ -299,6 +309,7 @@ class EquiformerV3DeNS_OC(EquiformerV3_OC):
             edge_index,
             edge_envelope_weight,
             batch,
+            cond,
         )
         return x_scalar, x, edge_distance, edge_envelope_weight
 
@@ -325,7 +336,9 @@ class EquiformerV3DeNS_OC(EquiformerV3_OC):
         source_atomic_numbers = atomic_numbers[edge_index[0]]
         target_atomic_numbers = atomic_numbers[edge_index[1]]
 
-        force_embedding, noise_mask_tensor, dens_batch_mask_tensor, dens_mask_tensor = self._forward_dens_force_encoding(data)
+        cond = self._forward_cond(data)
+        force_embedding, noise_mask_tensor, dens_batch_mask_tensor, dens_mask_tensor = \
+            self._forward_dens_force_encoding(data, cond)
         compute = self.core_compute
         if self.enable_compile:
             if self._compiled_core is None:
@@ -339,6 +352,7 @@ class EquiformerV3DeNS_OC(EquiformerV3_OC):
             edge_index,
             data.batch,
             force_embedding,
+            cond,
         )
 
         outputs = {}
@@ -452,7 +466,9 @@ class EquiformerV3DeNS_OC(EquiformerV3_OC):
         source_atomic_numbers = atomic_numbers[edge_index[0]]
         target_atomic_numbers = atomic_numbers[edge_index[1]]
 
-        force_embedding, noise_mask_tensor, dens_batch_mask_tensor, dens_mask_tensor = self._forward_dens_force_encoding(data)
+        cond = self._forward_cond(data)
+        force_embedding, noise_mask_tensor, dens_batch_mask_tensor, dens_mask_tensor = \
+            self._forward_dens_force_encoding(data, cond)
         x_scalar, x, edge_distance, edge_envelope_weight = self.core_compute(
             atomic_numbers,
             edge_distance,
@@ -460,6 +476,7 @@ class EquiformerV3DeNS_OC(EquiformerV3_OC):
             edge_index,
             data.batch,
             force_embedding,
+            cond,
         )
 
         outputs = {}
@@ -523,7 +540,7 @@ class EquiformerV3DeNS_OC(EquiformerV3_OC):
         core_compute to get the equivariant feature ``x`` it needs.
 
         Stale-bake guard: every per-batch tensor (atomic_numbers, edge_index,
-        cell_offsets, cell, batch, force_embedding) is an explicit core_fn input,
+        cell_offsets, cell, batch, force_embedding, cond) is an explicit core_fn input,
         NOT a closure capture. force_embedding is computed eagerly (it is constant
         wrt pos) and passed in as ``fe``; the traced region stays differentiable
         wrt fe, so the SO3Linear force_embedding's params still receive gradients
@@ -556,33 +573,34 @@ class EquiformerV3DeNS_OC(EquiformerV3_OC):
         source_atomic_numbers = atomic_numbers[edge_index[0]]
         target_atomic_numbers = atomic_numbers[edge_index[1]]
 
+        cond = self._forward_cond(data)
         force_embedding, noise_mask_tensor, dens_batch_mask_tensor, dens_mask_tensor = \
-            self._forward_dens_force_encoding(data)
+            self._forward_dens_force_encoding(data, cond)
 
         energy_block = self.energy_block
         avg_num_nodes = self.avg_num_nodes
 
-        def _energy(pos_p, cell_p, an, ei, co, batch, fe, n_sys):
+        def _energy(pos_p, cell_p, an, ei, co, batch, fe, n_sys, cond):
             co = co.reshape(ei.shape[1], -1)
             src, dst = ei[0], ei[1]
             cell_e = cell_p.index_select(0, batch.index_select(0, src))
             shifts = torch.einsum("ej,ejk->ek", co, cell_e)
             edv = pos_p.index_select(0, src) - pos_p.index_select(0, dst) + shifts
             ed = torch.linalg.norm(edv, dim=-1)
-            x_scalar, _x, _, _ = self.core_compute(an, ed, edv, ei, batch, fe)
+            x_scalar, _x, _, _ = self.core_compute(an, ed, edv, ei, batch, fe, cond)
             node_e = energy_block(x_scalar).view(-1)
             energy = torch.zeros(n_sys, device=node_e.device, dtype=node_e.dtype)
             energy.index_add_(0, batch, node_e)
             energy = energy / avg_num_nodes
             return energy
 
-        def core_fn_stress(pos, disp, an, ei, co, cell, batch, fe):
+        def core_fn_stress(pos, disp, an, ei, co, cell, batch, fe, cond=None):
             sym = 0.5 * (disp + disp.transpose(-1, -2))
             pos_p = pos + torch.bmm(
                 pos.unsqueeze(-2), torch.index_select(sym, 0, batch)
             ).squeeze(-2)
             cell_p = cell + torch.bmm(cell, sym)
-            energy = _energy(pos_p, cell_p, an, ei, co, batch, fe, cell.shape[0])
+            energy = _energy(pos_p, cell_p, an, ei, co, batch, fe, cell.shape[0], cond)
             grads = torch.autograd.grad([energy.sum()], [pos, disp], create_graph=True)
             forces = torch.neg(grads[0])
             virial = grads[1].view(-1, 3, 3)
@@ -590,8 +608,8 @@ class EquiformerV3DeNS_OC(EquiformerV3_OC):
             stress = (virial / volume.view(-1, 1, 1)).view(-1, 9)
             return energy, forces, stress
 
-        def core_fn_force(pos, an, ei, co, cell, batch, fe):
-            energy = _energy(pos, cell, an, ei, co, batch, fe, cell.shape[0])
+        def core_fn_force(pos, an, ei, co, cell, batch, fe, cond=None):
+            energy = _energy(pos, cell, an, ei, co, batch, fe, cell.shape[0], cond)
             forces = torch.neg(
                 torch.autograd.grad(energy.sum(), pos, create_graph=True)[0]
             )
@@ -614,35 +632,49 @@ class EquiformerV3DeNS_OC(EquiformerV3_OC):
         dyn = self.compile_dynamic
 
         def _prime(stress):
-            # dynamic=True only: append a prime force_embedding leaf so the trace
-            # example matches the real (pos[,disp],an,ei,co,cell,batch,fe) layout.
+            # dynamic=True only: append a prime force_embedding leaf (and the cond
+            # leaf) so the trace example matches the real
+            # (pos[,disp],an,ei,co,cell,batch,fe,cond) layout.
             pe = make_prime_graph_example(pos.device, dtype, stress=stress)
             fe_p = torch.zeros(pe[0].shape[0], *fe.shape[1:], device=pos.device, dtype=dtype)
-            return (*pe, fe_p)
+            if cond is None:
+                return (*pe, fe_p, None)
+            cond_p = torch.zeros(pe[0].shape[0], *cond.shape[1:], device=pos.device, dtype=dtype)
+            return (*pe, fe_p, cond_p)
 
+        # cond 恒占一个 traced 入参位（make_fx 走 fx 的 concrete_args，实参个数必须与
+        # 形参个数相等，少传会 "Tracing expected N arguments"）。cond 为 None 时它被
+        # 当常量烤进图 —— 模型配置在构造时已固定，一个进程只会出现一种形态。
+        # mark_dynamic 只对张量有意义，故 None 时不进 dynamic_dims。
         outputs = {}
         if self.regress_stress and self.regress_forces:
             disp = torch.zeros(
                 (cell.shape[0], 3, 3), device=pos.device, dtype=dtype
             ).requires_grad_(True)
+            stress_dyn = [(pos, [0]), (disp, [0]), (an, [0]), (ei, [1]),
+                          (co, [0]), (cell, [0]), (batch, [0]), (fe, [0])]
+            if cond is not None:
+                stress_dyn.append((cond, [0]))
             energy, forces, stress = self._compiled_region(
                 core_fn_stress,
-                (pos, disp, an, ei, co, cell, batch, fe),
+                (pos, disp, an, ei, co, cell, batch, fe, cond),
                 trace_example=_prime(True) if dyn else None,
-                dynamic_dims=[(pos, [0]), (disp, [0]), (an, [0]), (ei, [1]),
-                              (co, [0]), (cell, [0]), (batch, [0]), (fe, [0])] if dyn else None,
+                dynamic_dims=stress_dyn if dyn else None,
             )
             outputs['energy'] = energy
             outputs['forces'] = forces
             # stress not predicted during DeNS (per-system mask), eager outside region
             outputs['stress'] = stress * (~dens_batch_mask_tensor)
         elif self.regress_forces:
+            force_dyn = [(pos, [0]), (an, [0]), (ei, [1]), (co, [0]),
+                         (cell, [0]), (batch, [0]), (fe, [0])]
+            if cond is not None:
+                force_dyn.append((cond, [0]))
             energy, forces = self._compiled_region(
                 core_fn_force,
-                (pos, an, ei, co, cell, batch, fe),
+                (pos, an, ei, co, cell, batch, fe, cond),
                 trace_example=_prime(False) if dyn else None,
-                dynamic_dims=[(pos, [0]), (an, [0]), (ei, [1]), (co, [0]),
-                              (cell, [0]), (batch, [0]), (fe, [0])] if dyn else None,
+                dynamic_dims=force_dyn if dyn else None,
             )
             outputs['energy'] = energy
             outputs['forces'] = forces
@@ -659,6 +691,7 @@ class EquiformerV3DeNS_OC(EquiformerV3_OC):
                 edge_index,
                 data.batch,
                 force_embedding,
+                cond,
             )
             denoising_pos_vec = self.dens_block(
                 x,
@@ -706,7 +739,8 @@ class EquiformerV3DeNS_OC(EquiformerV3_OC):
         return force_data, force_sh, noise_mask_tensor, dens_batch_mask_tensor, dens_mask_tensor
 
 
-    def _forward_dens_force_encoding(self, data):
+    def _forward_dens_force_encoding(self, data, cond=None):
+        # DeNS 基类忽略 cond；SCD 子类用它决定是否把自条件叠加进输入嵌入
         force_data, force_sh, noise_mask_tensor, dens_batch_mask_tensor, dens_mask_tensor = self._generate_dens_data(data)
         force_norm = force_data.norm(dim=-1, keepdim=True)
         force_norm = force_norm / math.sqrt(3.0)

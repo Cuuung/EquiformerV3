@@ -174,8 +174,10 @@ class EquiformerV3SCD_OC(EquiformerV3DeNS_OC):
         cond_embedding[:, 0, :] = c
         return cond_embedding
 
-    def _forward_dens_force_encoding(self, data):
+    def _forward_dens_force_encoding(self, data, cond=None):
         """在 DeNS 的输入条件上叠加 SCD 自条件。
+
+        v0 走输入层注入，`cond`（AdaNorm 用的节点级条件）此处未用到。
 
         三条前向路径（direct / gradient / compiled）都只通过本方法拿
         `force_embedding` 再传进 `core_compute`，所以这里叠加即可，无需改动它们。
