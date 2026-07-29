@@ -275,7 +275,101 @@ python experimental/tests/test_scd_v1_config.py             # v1 配置解析 + 
 loss 权重、outputs、N2L2C64 结构、HybridMuon/moonlight 参数、DeNS 噪声参数）
 逐字沿用模板。
 
-## 7. 参考
+## 7. 从 SCD 预训练进入监督微调
+
+这一节回答实际用起来最容易踩坑的三件事：怎么关掉自条件、关掉之后模型还剩什么、
+以及保守力路径上的一个已知不一致。
+
+### 7.1 关掉自条件的两个开关，只有一个能装载预训练权重
+
+| 想要 | 开关 | 能否加载 SCD ckpt |
+|---|---|---|
+| 保留结构，只是不再加噪 | `optim.use_denoising_pos: False` | ✅ |
+| 结构上退回纯 DeNS | `model.use_scd: False` | ❌ |
+
+`use_scd: False` 时**不创建**条件生成链路（`scd_cond_head` / `scd_mask_token` /
+`scd_cond_norm` / `scd_cond_proj`），也不重建 AdaNorm blocks——回归测试实测其
+`state_dict` 键集合与 `equiformer_v3_dens` 逐一相同。代价正是：SCD ckpt 里的
+`scd_*` 键会成为 unexpected key，装不进去。
+
+所以「先 SCD 预训练、再监督微调」这条流水线**只能用 `use_denoising_pos: False`**。
+`use_scd: False` 的用途是从头跑一个纯 DeNS 对照组。
+
+### 7.2 微调阶段 AdaNorm 仍在，且仍在训练
+
+`scd_inject='adanorm'` 时 AdaNorm 在**构造期**就建好，与运行时加不加噪无关。
+微调阶段每个 block 的 `norm_1` / `norm_2` 依然是 `EquivariantAdaNorm`，其
+`fc` 参数照常接收梯度。
+
+这与参考实现一致：`configs/finetune_qm9.yaml` 是 `reset_norms: null`（提供了
+重置 AdaNorm 的选项但默认不用），`scd_model.py:finetune()` 只解冻元素嵌入与
+标量头，不冻结 `conditional_ln`。
+
+成本：N@7 L@4 C@128 下单个 AdaNorm 的 `fc` 约 21.5 万参数，每 block 两个、
+七层，合计约 **3.0M** 参数在微调阶段一路带着。
+
+### 7.3 数学上是否等价于原始 equiv3：三种情形
+
+关键在 `EquivariantAdaNorm.forward` 的这两行：
+
+```python
+node_feat = x.narrow(1, 0, 1).squeeze(1).detach()   # [N, C]，norm 后的 L=0 切片
+inp = torch.cat([cond, node_feat], dim=-1)          # 前半是条件，后半是本节点特征
+```
+
+`fc` 的输入分两半：`cond` 全图共享，`node_feat` **逐节点不同**。因此即使微调阶段
+`cond` 退化成常量（见下），调制量仍随每个节点自己的特征变化。
+
+| 情形 | 与原 equiv3 的关系 |
+|---|---|
+| 刚构造（`fc` 末层零初始化） | **逐位等价** —— `1+scale=1`、`shift=0`、`1+gate=1` |
+| SCD 预训练后 + `use_denoising_pos: False` 微调 | **不等价**：逐节点、依赖数据的调制 |
+| `scd_adanorm_use_node_feat: False` + 常量 cond | 等价于换了一组 affine 参数的普通 norm（可折叠） |
+
+**微调阶段的 cond 是什么**：`do_self_cond = self.training and denoising_pos_forward`
+恒为 False，走 else 分支 → `c = scd_mask_token.expand(...)`。`scd_mask_token` 是
+一个 `[1, C]` 的可学习参数，代表「无条件」状态：预训练时 dropcond 以
+`scd_p_dropcond`（默认 0.2）的概率把某个图的条件替换成它，逼模型学会无条件也能
+工作（classifier-free guidance 的手法）；微调与推理时条件**恒为**它。
+
+**想要预训练完能回到干净 equiv3 的**：改用 `scd_inject='input'` 预训练。那样不建
+AdaNorm，norm 全程原样；微调时常量 cond 只是给 L=0 输入嵌入加一个学到的常量偏置，
+可折叠，backbone 与 equiv3 逐字相同。代价是放弃论文形态的 AdaNorm 注入——
+`scd_inject` 存在的意义之一正是让这两条路可直接对比。
+
+### 7.4 已知问题：保守力下 `F ≠ -∇E`
+
+**直接力预测不受影响**（力是独立输出头）。**保守力路径有实测可见的不一致。**
+
+`node_feat` 上的 `.detach()` 截断了能量对坐标的一条依赖路径：能量确实通过调制量
+依赖坐标，但 autograd 求 `-dE/dpos` 时不会走这条路。有限差分实测（N2L2C64、
+`direct_prediction: False`、fp32、eps=3e-3）：
+
+| 配置 | max\|F_auto − F_fd\| | 判断 |
+|---|---|---|
+| AdaNorm 未训练（`fc` 零初始化） | 7.0e-5 | 有限差分噪声地板 |
+| **AdaNorm 已训练，`use_node_feat=True`（默认）** | **4.2e-2** | **高出噪声地板 600 倍** |
+| AdaNorm 已训练，`use_node_feat=False` | 8.0e-5 | 噪声地板 |
+| 对照：`scd_inject=input`（无 AdaNorm） | 7.0e-5 | 噪声地板 |
+
+后果：MD 中能量不守恒；用保守力训练相当于拟合一个自相矛盾的目标（能量与力互不
+一致）；应力同样受影响（virial 也来自 autograd）。
+
+**注意势能面 `E(pos)` 本身仍是光滑的** —— `detach` 不改变前向。问题不是光滑性，
+是力与能量的自洽性。
+
+**关于 detach 的来源**：论文正文 §3.3、附录 B 与 Figure 3 caption 都只说「每层用
+一个两层 MLP 做条件调制」，既未描述把节点自身特征拼进 MLP 输入，也未提
+stop-gradient——这两个都是只存在于参考代码（`scd/models/modules/conditioning.py`
+的 `adaLN2`）里的实现细节。至于 detach 的动机，论文与代码注释都没有说明；一种
+合理推测是避免 `∂L/∂x` 出现「经输出」与「经调制系数」两条自指路径，但这是推测
+而非文献依据。
+
+**缓解办法**（尚未实施，需要时再定）：去掉 `.detach()` 可让 `F = -∇E` 严格成立
+并保留逐节点自适应；或设 `scd_adanorm_use_node_feat: False` 让调制只依赖常量条件
+（实测回到噪声地板，但表达力大减）。
+
+## 8. 参考
 
 设计文档：`docs/superpowers/specs/2026-07-29-scd-v1-design.md`（架构决策、
 已否决方案、风险表）。
