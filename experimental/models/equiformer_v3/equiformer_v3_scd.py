@@ -114,31 +114,38 @@ class EquiformerV3SCD_OC(EquiformerV3DeNS_OC):
         if not self.use_force_cond:
             self.force_embedding = None
 
-        self.scd_cond_head = SCDCondHead(self.num_channels)
-        self.scd_mask_token = torch.nn.Parameter(torch.zeros(1, self.num_channels))
-        self.scd_cond_norm = torch.nn.LayerNorm(self.num_channels)
-        self.scd_cond_proj = torch.nn.Linear(self.num_channels, self.num_channels)
+        # `use_scd=False` 时**不创建**条件生成链路：这些模块在该模式下无人消费，
+        # 建出来只会变成 DDP 的 unused parameter（find_unused_parameters=False 下
+        # 直接报 reduction 错误），且白占优化器状态与 ckpt 体积。不建则本类结构上
+        # 等同于父类 DeNS。
+        if self.use_scd:
+            self.scd_cond_head = SCDCondHead(self.num_channels)
+            self.scd_mask_token = torch.nn.Parameter(torch.zeros(1, self.num_channels))
+            self.scd_cond_norm = torch.nn.LayerNorm(self.num_channels)
+            self.scd_cond_proj = torch.nn.Linear(self.num_channels, self.num_channels)
 
-        if self.use_scd and self.scd_inject in ('adanorm', 'both'):
-            self._rebuild_blocks_with_adanorm(
-                targets=tuple(scd_adanorm_targets),
-                scope=scd_adanorm_scope,
-                use_node_feat=scd_adanorm_use_node_feat,
-            )
+            if self.scd_inject in ('adanorm', 'both'):
+                self._rebuild_blocks_with_adanorm(
+                    targets=tuple(scd_adanorm_targets),
+                    scope=scd_adanorm_scope,
+                    use_node_feat=scd_adanorm_use_node_feat,
+                )
 
         self.apply(self._init_weights)
-        torch.nn.init.xavier_uniform_(self.scd_mask_token)
-        # 零初始化：初始状态下 SCD 分支恒输出 0，与父类 DeNS 逐位一致，
-        # 便于从既有 DeNS ckpt 续训。
-        torch.nn.init.constant_(self.scd_cond_proj.weight, 0.0)
-        torch.nn.init.constant_(self.scd_cond_proj.bias, 0.0)
+        if self.use_scd:
+            torch.nn.init.xavier_uniform_(self.scd_mask_token)
+            # 零初始化：初始状态下 SCD 分支恒输出 0，与父类 DeNS 逐位一致，
+            # 便于从既有 DeNS ckpt 续训。
+            torch.nn.init.constant_(self.scd_cond_proj.weight, 0.0)
+            torch.nn.init.constant_(self.scd_cond_proj.bias, 0.0)
 
         self._apply_element_embedding_freeze()
 
     @torch.jit.ignore
     def no_weight_decay(self):
         no_wd_list = super().no_weight_decay()
-        no_wd_list.add("scd_mask_token")
+        if self.use_scd:
+            no_wd_list.add("scd_mask_token")
         return no_wd_list
 
     def _apply_element_embedding_freeze(self):
@@ -152,7 +159,7 @@ class EquiformerV3SCD_OC(EquiformerV3DeNS_OC):
         level = self.scd_freeze_element_embedding
         assert level in self._FREEZE_LEVELS, f"unknown freeze level: {level}"
 
-        if self.scd_freeze_mask_token:
+        if self.scd_freeze_mask_token and self.use_scd:
             self.scd_mask_token.requires_grad_(False)
 
         if level == 'none':

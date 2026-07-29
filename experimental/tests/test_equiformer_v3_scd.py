@@ -710,6 +710,40 @@ c2 = m_off._scd_cond_vector(bq)
 check("对照组 reg noise 关: 两次 clean 前向的条件相同",
       torch.allclose(c1, c2, atol=1e-6))
 
+# ============== use_scd=False 退回纯 DeNS（结构与 DDP 安全） ==============
+# 语义是「退回纯 DeNS」，所以条件生成链路根本不该被创建 —— 建出来无人消费，
+# 在 DDP find_unused_parameters=False 下会直接报 reduction 错误。
+m_off = build(use_scd=False)
+scd_params = [n for n, _ in m_off.named_parameters() if n.startswith("scd_")]
+check("use_scd=False: 不创建任何 scd_* 参数", not scd_params, f"{scd_params[:3]}")
+check("use_scd=False: blocks 不含 AdaNorm",
+      all(not getattr(b, "use_adanorm_1", False) and not getattr(b, "use_adanorm_2", False)
+          for b in m_off.blocks))
+check("use_scd=False: no_weight_decay 不含 scd_mask_token",
+      "scd_mask_token" not in m_off.no_weight_decay())
+
+# 与父类 DeNS 的参数名集合完全一致 —— 这是「结构上等同」的可执行判据
+m_dens_ref = registry.get_model_class("equiformer_v3_dens")(**MODEL_CFG).to(DEV)
+off_keys = set(m_off.state_dict().keys())
+dens_keys = set(m_dens_ref.state_dict().keys())
+check("use_scd=False: state_dict 键集合与 equiformer_v3_dens 完全一致",
+      off_keys == dens_keys,
+      f"多 {len(off_keys - dens_keys)} 少 {len(dens_keys - off_keys)}")
+
+# 非去噪 step 反传后不得有 requires_grad=True 却 grad is None 的参数
+m_off.train()
+o_off = m_off(make_batch(seed=91))
+(o_off["energy"].sum() + o_off["forces"].sum() + o_off["stress"].sum()).backward()
+dead_off = [n for n, p in m_off.named_parameters() if p.requires_grad and p.grad is None]
+check("use_scd=False: 非去噪 step 无 DDP unused param", not dead_off, f"{dead_off[:3]}")
+
+# scd_freeze_mask_token=True 在 use_scd=False 下不得抛异常（mask token 不存在）
+try:
+    build(use_scd=False, scd_freeze_mask_token=True)
+    check("use_scd=False + scd_freeze_mask_token=True 不报错", True)
+except Exception as e:
+    check("use_scd=False + scd_freeze_mask_token=True 不报错", False, repr(e))
+
 print()
 if FAILURES:
     print(f"FAILED: {len(FAILURES)} -> {FAILURES}")
