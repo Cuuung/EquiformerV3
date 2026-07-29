@@ -597,12 +597,13 @@ class EquiformerV3DeNSTrainer(EquiformerV2ForcesTrainer):
                     logging.info(", ".join(log_str))
                     self.metrics = {}
 
-                # 元素嵌入范数诊断（按 print_every 节流：每步算 16 次 .norm() + float()
-                # 会引入同样多次 GPU 同步）
-                if self.step % self.config["cmd"]["print_every"] == 0:
-                    log_dict.update(element_embedding_norms(self.model))
-
                 if self.logger is not None:
+                    # 元素嵌入范数诊断：放在此块内，非 master rank 的 self.logger 恒为
+                    # None（见 base_trainer 里 logger 的赋值条件），天然跳过这 16 次
+                    # .norm() + float() 带来的 GPU 同步；再叠加 print_every 节流，避免
+                    # master rank 自己每步都算。
+                    if self.step % self.config["cmd"]["print_every"] == 0:
+                        log_dict.update(element_embedding_norms(self.model))
                     self.logger.log(
                         log_dict,
                         step=self.step,
