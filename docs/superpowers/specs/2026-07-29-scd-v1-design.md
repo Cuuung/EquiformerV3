@@ -171,8 +171,9 @@ become vanishingly small, leading to downstream instability"）。
 与 `base_trainer.py:774` 都会跳过冻结参数；HybridMuon 仅在组非空时建组。冻结参数不进
 autograd 图，不触发 DDP unused-param。
 
-**为什么默认 `none`**：equiv3 的元素身份有三个入口共 16 张表（`sphere_embedding` 1 张、
-`EdgeDegreeEmbedding` 2 张、每个 attention block 2 张），而参考实现的 ET 只有 1 张。
+**为什么默认 `none`**：equiv3 的元素身份有三个入口共 `1 + 2 + 2×num_layers` 张表
+（`sphere_embedding` 1 张、`EdgeDegreeEmbedding` 2 张、每个 attention block 2 张），
+N@7 为 17 张、N2L2C64 为 7 张，而参考实现的 ET 只有 1 张。
 论文结论不能直接外推 —— 只冻 `sphere_embedding` 时元素信息仍可从另两个入口进入，
 塌缩未必被阻止，甚至可能只是转移到其余表上。
 

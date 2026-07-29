@@ -416,6 +416,23 @@ class EquivariantAdaNorm(torch.nn.Module):
                 f"num_channels={self.num_channels}, cond_channels={self.cond_channels}, "
                 f"scope={self.scope}, use_node_feat={self.use_node_feat})")
 
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        """兼容 AdaNorm 之前的 ckpt：把 <prefix>affine_* 重映射到 <prefix>norm.*。
+
+        本类把原 norm 包了一层，键名多出一级 `norm.`。没有这个钩子，既有
+        equiformer_v3 / DeNS 的 ckpt 在 strict=True 下会直接报错，strict=False
+        下会静默把这些 affine 参数重置为初值——而 identity-init 的全部意义
+        就是让既有 ckpt 能无损续训。
+        """
+        for key in ('affine_weight', 'affine_bias', 'balance_degree_weight'):
+            old_key = prefix + key
+            if old_key in state_dict:
+                state_dict[prefix + 'norm.' + key] = state_dict.pop(old_key)
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict,
+            missing_keys, unexpected_keys, error_msgs)
+
     def _broadcast(self, v):
         """[N, num_mod_degrees, C] -> 可与 [N, (lmax+1)**2, C] 相乘的 delta。"""
         if self.scope == 'per_degree':

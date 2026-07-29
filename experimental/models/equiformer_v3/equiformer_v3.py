@@ -593,7 +593,7 @@ class EquiformerV3_OC(torch.nn.Module, GraphModelMixin):
             edge_distance_vec,
             edge_index,
             data.batch,
-            None,      # 基类无条件；显式传入以免编译区把默认值烤成常量
+            None,      # 基类无条件；显式传入以与 DeNS 版 core_compute 的调用形状对齐
         )
 
         outputs = {}

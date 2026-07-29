@@ -1,12 +1,13 @@
-"""Self-Conditioned Denoising (SCD) for EquiformerV3 —— v0.
+"""Self-Conditioned Denoising (SCD) for EquiformerV3 —— v0 / v1 并存。
 
 参考 Perez & Gómez-Bombarelli, *Self-Conditioned Denoising for Atomistic
 Representation Learning* (2026)。
 
-v0 与论文的差异：论文把条件向量经 AdaNorm 注入每个 block 的 pre-attention
-LayerNorm；v0 改用 DeNS 同款的**输入层加法**注入（写进 L=0 通道），因此不需要
-改动 `TransBlockV3` / `core_compute` 的签名，可以整套复用 `EquiformerV3DeNS_OC`
-的 direct / gradient / compiled 三条前向路径。AdaNorm 版留给 v1。
+条件向量的注入方式由 `scd_inject` 选择：v0 的 `'input'` 用 DeNS 同款的**输入层
+加法**注入（写进 L=0 通道），不改动 `TransBlockV3` / `core_compute` 的签名，可以
+整套复用 `EquiformerV3DeNS_OC` 的 direct / gradient / compiled 三条前向路径；
+v1 的 `'adanorm'`（默认）则按论文把条件向量经 AdaNorm 注入每个 block 的
+pre-attention LayerNorm，`'both'` 两者叠加。见 `_rebuild_blocks_with_adanorm`。
 
 数据流（仅在训练且该 step 施加了 DeNS 噪声时走双前向）：
     clean pos -> core_compute -> L=0 特征 -> sum-pool -> MLP -> c  [B, C]
@@ -251,6 +252,14 @@ class EquiformerV3SCD_OC(EquiformerV3DeNS_OC):
                 c = c * keep + self.scd_mask_token * (1.0 - keep)
         else:
             c = self.scd_mask_token.expand(num_graphs, -1)
+            # 让 scd_cond_head 恒入 autograd 图（grad 为 0 而非 None）。否则非去噪 step 上
+            # 它拿不到梯度，DDP find_unused_parameters=False 会在下一步报 reduction 错误。
+            # 与 mask_token 的 `c*keep + mask_token*(1-keep)` 同理。
+            zero_x = torch.zeros(
+                data.batch.shape[0], self.num_channels,
+                device=self.scd_mask_token.device, dtype=self.scd_mask_token.dtype,
+            )
+            c = c + 0.0 * self.scd_cond_head(zero_x, data.batch, num_graphs)
 
         c = self.scd_cond_norm(c)
         c = c.clamp(min=-self.scd_cond_clip, max=self.scd_cond_clip)

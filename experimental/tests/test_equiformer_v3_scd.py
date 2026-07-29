@@ -133,6 +133,9 @@ with torch.no_grad():
 
 # ------------------------------------------------------- 3. direct 双前向
 b = add_noise(make_batch())
+# scd_p_dropcond=0.2 + num_graphs=2：两图同时被丢的概率 4%，此时 scd_cond_head
+# 梯度恒零，下面的非零梯度断言会假失败。固定种子消除这个不确定性。
+torch.manual_seed(101)
 out = model(b)
 check(
     "direct + denoising: 前向可跑",
@@ -245,6 +248,8 @@ m3.train()
 with torch.no_grad():
     m3.scd_cond_proj.weight.normal_(0, 0.05)
 b3 = add_noise(make_batch(seed=5))
+# 同上：固定种子避免 dropcond 两图同丢导致的假失败。
+torch.manual_seed(202)
 o3 = m3(b3)
 check(
     "gradient(保守力) 路径可跑",
@@ -265,6 +270,28 @@ check(
 
 # ------------------------------------------------------- 9. no_weight_decay
 check("scd_mask_token 进入 no_weight_decay", "scd_mask_token" in model.no_weight_decay())
+
+# ---------------------- 10. 非去噪 step 上 scd_cond_head 恒入图（DDP 安全） ----------------------
+# 非去噪 step 走 else 分支（mask_token），若 scd_cond_head 不被强行拉入图，
+# 它的 14 个参数 requires_grad=True 但 grad is None，DDP find_unused_parameters=False
+# 下一步就会抛 "Expected to have finished reduction..."。loss 必须用
+# energy+forces+stress 合成，只用 energy 的话输出头拿不到梯度，会因无关原因失败。
+m_nd = build()
+m_nd.train()
+with torch.no_grad():
+    m_nd.scd_cond_proj.weight.normal_(0, 0.05)
+b_nd = make_batch(seed=90)  # 不加噪：无 denoising_pos_forward，走 else 分支
+o_nd = m_nd(b_nd)
+loss_nd = o_nd["energy"].sum() + o_nd["forces"].sum() + o_nd["stress"].sum()
+loss_nd.backward()
+missing_grad_nd = [
+    n for n, p in m_nd.named_parameters() if p.requires_grad and p.grad is None
+]
+check(
+    "非去噪 step: 无任何 requires_grad=True 参数 grad 为 None（DDP find_unused_parameters=False 安全）",
+    not missing_grad_nd,
+    f"{missing_grad_nd[:5]}",
+)
 
 # =================================== 编译路径 ===================================
 
@@ -308,6 +335,8 @@ try:
 
     g = {n: (p.grad is not None) for n, p in m2.named_parameters() if n.startswith("scd_")}
     b = add_noise(make_batch(seed=13))
+    # 同上：固定种子避免 dropcond 两图同丢导致的假失败。
+    torch.manual_seed(606)
     o = m2(b)
     o["energy"].sum().backward()
     nz = [bool(p.grad is not None and p.grad.abs().sum() > 0)
@@ -325,6 +354,14 @@ try:
     m3 = build(direct_prediction=False, regress_stress=True)
     with torch.no_grad():
         m3.scd_cond_proj.weight.normal_(0, 0.05)
+        # 默认 scd_inject='adanorm'：不打破 AdaNorm 调制头的零初始化，cond 对
+        # 输出毫无影响，即便编译区把 cond 整个丢掉本测试也测不出来（假阳性）。
+        for blk in m3.blocks:
+            if getattr(blk, "use_adanorm_1", False):
+                blk.norm_1.fc[-1].weight.normal_(0, 0.05)
+                blk.norm_1.fc[-1].bias.normal_(0, 0.05)
+                blk.norm_2.fc[-1].weight.normal_(0, 0.05)
+                blk.norm_2.fc[-1].bias.normal_(0, 0.05)
     sd = {k: v.clone() for k, v in m3.state_dict().items()}
     m4 = build(direct_prediction=False, regress_stress=True,
                enable_compile=True, compile_dynamic=False)
@@ -368,6 +405,14 @@ try:
     m6 = build(direct_prediction=True)
     with torch.no_grad():
         m6.scd_cond_proj.weight.normal_(0, 0.05)
+        # 同上：默认 scd_inject='adanorm'，须打破调制头零初始化才能让 cond
+        # 透传对数值比较敏感。
+        for blk in m6.blocks:
+            if getattr(blk, "use_adanorm_1", False):
+                blk.norm_1.fc[-1].weight.normal_(0, 0.05)
+                blk.norm_1.fc[-1].bias.normal_(0, 0.05)
+                blk.norm_2.fc[-1].weight.normal_(0, 0.05)
+                blk.norm_2.fc[-1].bias.normal_(0, 0.05)
     sd6 = {k: v.clone() for k, v in m6.state_dict().items()}
     m7 = build(direct_prediction=True, enable_compile=True, compile_dynamic=False)
     m7.load_state_dict(sd6)
@@ -411,6 +456,8 @@ m_ckpt = build(gradient_checkpointing_block_list=[1, 1], scd_inject="input")
 m_ckpt.train()
 with torch.no_grad():
     m_ckpt.scd_cond_proj.weight.normal_(0, 0.05)
+# 同上：固定种子避免 dropcond 两图同丢导致的假失败。
+torch.manual_seed(303)
 o_ckpt = m_ckpt(add_noise(make_batch(seed=51)))
 o_ckpt["energy"].sum().backward()
 nz_ckpt = [
@@ -431,6 +478,8 @@ for mode in ("input", "adanorm", "both"):
             if getattr(blk, "use_adanorm_1", False):
                 blk.norm_1.fc[-1].weight.normal_(0, 0.05)
                 blk.norm_2.fc[-1].weight.normal_(0, 0.05)
+    # 同上：固定种子避免 dropcond 两图同丢导致的假失败。
+    torch.manual_seed(404)
     o = mm(add_noise(make_batch(seed=60)))
     o["energy"].sum().backward()
     check(f"scd_inject={mode}: direct 前向+反传可跑", o["energy"].shape == (2,))
@@ -466,7 +515,25 @@ torch.manual_seed(77)
 m_scd = build(scd_inject="adanorm")
 m_dens_cfg = dict(MODEL_CFG)
 m_dens = registry.get_model_class("equiformer_v3_dens")(**m_dens_cfg).to(DEV)
-shared = {k: v for k, v in m_scd.state_dict().items() if k in m_dens.state_dict()}
+m_scd_sd, m_dens_sd = m_scd.state_dict(), m_dens.state_dict()
+# EquivariantAdaNorm 把原 norm 包了一层，键名多出 `norm.` 一级：
+# blocks.{i}.norm_{1,2}.affine_{weight,bias}/balance_degree_weight 这 12 个键
+# 在 m_scd 侧变成 blocks.{i}.norm_{1,2}.norm.同名键。显式断言这个键集合差异，
+# 而不是用 `if k in m_dens_sd` 静默过滤掉它们——否则下面的等价性检查即便这
+# 12 个键完全没被复制过去，也会因两侧的 affine_weight 恰好是同一份确定性
+# 初始化（torch.ones）而"误判"通过。
+adanorm_only_keys = {
+    f"blocks.{i}.norm_{n}.norm.{k}"
+    for i in range(MODEL_CFG["num_layers"])
+    for n in (1, 2)
+    for k in ("affine_weight", "affine_bias", "balance_degree_weight")
+}
+check(
+    "identity-init: AdaNorm 的 norm.* 重映射键集合与预期一致（12 个）",
+    adanorm_only_keys <= (set(m_scd_sd) - set(m_dens_sd)),
+    f"缺失: {adanorm_only_keys - (set(m_scd_sd) - set(m_dens_sd))}",
+)
+shared = {k: v for k, v in m_scd_sd.items() if k in m_dens_sd}
 missing, unexpected = m_dens.load_state_dict(shared, strict=False)
 m_scd.eval(); m_dens.eval()
 b_a = add_noise(make_batch(seed=78))
@@ -478,6 +545,41 @@ with torch.no_grad():
     o_dens = m_dens(b_b)
 de = (o_scd["energy"] - o_dens["energy"]).abs().max().item()
 check("identity-init: adanorm 模型 == 同权重 DeNS", de < 1e-5, f"max|dE|={de:.2e}")
+
+# EquivariantAdaNorm._load_from_state_dict 钩子：既有（AdaNorm 之前）ckpt 的
+# 扁平键名 affine_weight/affine_bias/balance_degree_weight 应被重映射到
+# norm.同名键，用 strict=True 加载不报错，且加载后的值确实来自"ckpt"而非
+# 该层自身的零初始化默认值。用单个 AdaNorm 子模块而非整模型 strict=True，
+# 是因为整模型下 SCD 独有的子模块（scd_cond_head 等）与 AdaNorm 本身新增的
+# fc.* / l0_mask / 嵌套 norm.expand_index 在任何实现下都不存在于旧 ckpt，
+# strict=True 必然因这些与本次要修的键名重映射无关的差异而报错；已用脚本
+# 实测核实（见 final-fix-report.md）。
+from fairchem.experimental.models.equiformer_v3.layer_norm import EquivariantAdaNorm
+
+adanorm_mod = m_scd.blocks[0].norm_1
+full_sd = {k: v.clone() for k, v in adanorm_mod.state_dict().items()}
+old_style_sd = dict(full_sd)
+for k in ("affine_weight", "affine_bias", "balance_degree_weight"):
+    old_style_sd[k] = torch.randn_like(old_style_sd.pop("norm." + k))
+
+fresh_adanorm = EquivariantAdaNorm(
+    norm_type=MODEL_CFG["norm_type"], lmax=adanorm_mod.lmax,
+    num_channels=adanorm_mod.num_channels, cond_channels=adanorm_mod.cond_channels,
+    scope=adanorm_mod.scope, use_node_feat=adanorm_mod.use_node_feat,
+).to(DEV)
+try:
+    fresh_adanorm.load_state_dict(old_style_sd, strict=True)
+    hook_loaded_ok = (
+        torch.equal(fresh_adanorm.norm.affine_weight, old_style_sd["affine_weight"])
+        and torch.equal(fresh_adanorm.norm.affine_bias, old_style_sd["affine_bias"])
+        and torch.equal(fresh_adanorm.norm.balance_degree_weight, old_style_sd["balance_degree_weight"])
+        and not torch.equal(fresh_adanorm.norm.affine_weight, full_sd["norm.affine_weight"])
+    )
+    check("AdaNorm._load_from_state_dict 钩子: 旧 ckpt 扁平键 strict=True 加载成功且值来自 ckpt",
+          hook_loaded_ok)
+except Exception as e:
+    check("AdaNorm._load_from_state_dict 钩子: 旧 ckpt 扁平键 strict=True 加载成功且值来自 ckpt",
+          False, f"{type(e).__name__}: {str(e)[:300]}")
 
 # adanorm 模式的旋转等变（调制头非零）
 m_eq = build(scd_inject="adanorm")

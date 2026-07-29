@@ -184,10 +184,11 @@ DiT 的 adaLN-Zero 让 `gate = 0`，残差支在 step 0 完全关闭——那是
 
 `scd_freeze_element_embedding: none | sphere | sphere_edge | all`
 （`experimental/models/equiformer_v3/equiformer_v3_scd.py::_apply_element_embedding_freeze`）。
-equiv3 的元素身份有三个入口共 16 张 embedding 表（`sphere_embedding` 1 张、
-`EdgeDegreeEmbedding.{source,target}_embedding` 2 张、每个 attention block 的
-`ga.{source,target}_embedding` 2 张 × 层数），比论文参考实现（ET，仅 1 张）
-多得多，因此拆成四档递进冻结。**输出头（`force_block` / `dens_block` /
+equiv3 的元素身份有三个入口共 `1 + 2 + 2×num_layers` 张 embedding 表
+（`sphere_embedding` 1 张、`EdgeDegreeEmbedding.{source,target}_embedding` 2 张、
+每个 attention block 的 `ga.{source,target}_embedding` 2 张 × 层数），N@7
+（`num_layers=7`）为 17 张、N2L2C64（`num_layers=2`）为 7 张，比论文参考实现
+（ET，仅 1 张）多得多，因此拆成四档递进冻结。**输出头（`force_block` / `dens_block` /
 `stress_block`）明确不在冻结范围**——它们是任务头而非输入通道。
 
 以下 `requires_grad=False` 参数量在本任务的配置里已实测核对（脚本对每档
