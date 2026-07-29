@@ -237,7 +237,7 @@ equiv3 的 `GraphDropPath`（`drop.py`）是 **per-graph** 整图丢弃，参考
 python experimental/tests/test_equiformer_v3_adanorm.py     # EquivariantAdaNorm 单元测试
 python experimental/tests/test_element_embedding_diag.py    # 元素嵌入范数诊断埋点
 python experimental/tests/test_equiformer_v3_scd.py         # 端到端回归（含 v0 + v1）
-python experimental/tests/test_scd_v1_config.py             # v1 配置解析 + 模型实例化（不需要 GPU 也能跑，但建议同镜像）
+python experimental/tests/test_scd_v1_config.py             # v1 配置解析 + 模型实例化，很快
 ```
 
 - **`test_equiformer_v3_adanorm.py`**：`EquivariantAdaNorm` 与 `TransBlockV3`
