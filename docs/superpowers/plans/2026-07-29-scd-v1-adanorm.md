@@ -637,7 +637,14 @@ Expected: 前几项 FAIL（`cond` 不在形参里），`_forward_cond` 抛 `Attr
 
 `_forward_gradient` 同样两处。
 
-`_conservative_compiled_forward`：`_energy` 与两个 `core_fn_*` 各加末位形参 `cond`；args 元组按 `cond` 是否为 `None` 构造，使 `None` 情形不进 traced 参数（make_fx 把默认值当常量烤进图，而模型配置在构造时已固定，一个进程只会出现一种形态）：
+`_conservative_compiled_forward`：`_energy` 与两个 `core_fn_*` 各加末位形参 `cond`。
+
+> **已由 Task 3 的编译测试证伪并修正：** 本计划最初要求「`cond is None` 时不把它放进
+> args 元组」。这是错的 —— `make_fx` 走 fx 的 `concrete_args`，**实参个数必须与形参
+> 个数相等**，少传会报 `Tracing expected N arguments`。正确做法是 **`cond` 恒占一个
+> traced 入参位**（`None` 也传，被当常量烤进图；模型配置在构造时固定，一个进程只会
+> 出现一种形态）。`dynamic_dims` 与 `_prime` 则仍按 `cond is None` 条件追加 ——
+> `mark_dynamic` 只对张量有意义。A/B/C/D 四段编译测试全绿证实了这一改法。
 
 ```python
         def _energy(pos_p, cell_p, an, ei, co, batch, fe, n_sys, cond):
@@ -1581,8 +1588,9 @@ eager/编译模型都要传同一个 `scd_inject=_mode`。
 Expected: `ALL PASS`。编译段从 8 项变为 16 项，总计 60 项。
 
 若 B/D 段在 `adanorm` 下报 stale-bake 或形状错误，检查 Task 3 中
-`_conservative_compiled_forward` 的 `force_args` / `force_dyn` / `_prime` 三处是否
-都按 `cond is None` 分支构造 —— 漏掉 `_prime` 只会在 `compile_dynamic=True` 下暴露。
+`_conservative_compiled_forward`：args 元组必须**恒含** `cond`（个数须与形参相等），
+而 `dynamic_dims` 与 `_prime` 按 `cond is None` 条件追加 —— 漏掉 `_prime` 只会在
+`compile_dynamic=True` 下暴露。
 
 - [ ] **Step 3: Commit**
 
