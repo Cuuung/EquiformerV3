@@ -9,8 +9,7 @@ from fairchem.core.common.registry import registry
 
 setup_imports()
 
-P = ("experimental/configs/omat24/mptrj/experiments/direct/scd_v1/"
-     "eager_fp32_N2L2C64.yml")
+P = "experimental/configs/omat24/mptrj/experiments/scd/eager_fp32_N2L2C64.yml"
 FAILURES = []
 
 
