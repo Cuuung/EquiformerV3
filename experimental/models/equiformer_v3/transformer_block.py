@@ -626,6 +626,8 @@ class TransBlockV3(torch.nn.Module):
             adanorm_targets (tuple):    Which pre-norms use AdaNorm: subset of `('attn', 'ffn')`.
             adanorm_scope (str):        Scope passed to `EquivariantAdaNorm` when AdaNorm is enabled.
             adanorm_use_node_feat (bool): Whether AdaNorm's condition MLP also sees the node's own L=0 feature.
+            adanorm_detach_node_feat (bool): Whether to `.detach()` that L=0 feature. 参考实现恒为 True；
+                                    保守力路径须设 False，见 `EquivariantAdaNorm`。
     """
     def __init__(
         self,
@@ -663,7 +665,8 @@ class TransBlockV3(torch.nn.Module):
         cond_channels=None,
         adanorm_targets=(),
         adanorm_scope='per_degree',
-        adanorm_use_node_feat=True
+        adanorm_use_node_feat=True,
+        adanorm_detach_node_feat=True
     ):
         super().__init__()
 
@@ -674,7 +677,8 @@ class TransBlockV3(torch.nn.Module):
             self.norm_1 = EquivariantAdaNorm(
                 norm_type, lmax=lmax, num_channels=num_in_channels,
                 cond_channels=cond_channels, scope=adanorm_scope,
-                use_node_feat=adanorm_use_node_feat
+                use_node_feat=adanorm_use_node_feat,
+                detach_node_feat=adanorm_detach_node_feat
             )
         else:
             self.norm_1 = get_normalization_layer(norm_type, lmax=lmax, num_channels=num_in_channels)
@@ -717,7 +721,8 @@ class TransBlockV3(torch.nn.Module):
             self.norm_2 = EquivariantAdaNorm(
                 norm_type, lmax=lmax, num_channels=num_in_channels,
                 cond_channels=cond_channels, scope=adanorm_scope,
-                use_node_feat=adanorm_use_node_feat
+                use_node_feat=adanorm_use_node_feat,
+                detach_node_feat=adanorm_detach_node_feat
             )
         else:
             self.norm_2 = get_normalization_layer(norm_type, lmax=lmax, num_channels=num_in_channels)

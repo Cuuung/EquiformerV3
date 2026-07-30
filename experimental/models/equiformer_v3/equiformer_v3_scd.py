@@ -67,6 +67,9 @@ class EquiformerV3SCD_OC(EquiformerV3DeNS_OC):
                                 换成 AdaNorm，见 `TransBlockV3`。
         scd_adanorm_scope (str): 见 `EquivariantAdaNorm`。
         scd_adanorm_use_node_feat (bool): 见 `EquivariantAdaNorm`。
+        scd_adanorm_detach_node_feat (bool): 见 `EquivariantAdaNorm`。默认 True 对齐
+                                参考实现；**保守力（`direct_prediction=False`）配置须设
+                                False**，否则 autograd 的力不是能量的真实梯度。
         scd_p_dropcond (float): 按图丢弃条件向量、替换为可学 mask token 的概率。
         scd_cond_clip (float):  条件向量的数值截断，对齐 SCD 原实现的稳定性处理。
         scd_detach_cond (bool): True 时切断 clean 前向的梯度（省一次 backward，
@@ -90,6 +93,7 @@ class EquiformerV3SCD_OC(EquiformerV3DeNS_OC):
         scd_adanorm_targets=('attn', 'ffn'),
         scd_adanorm_scope='per_degree',
         scd_adanorm_use_node_feat=True,
+        scd_adanorm_detach_node_feat=True,
         scd_p_dropcond=0.2,
         scd_cond_clip=100.0,
         scd_detach_cond=False,
@@ -129,6 +133,7 @@ class EquiformerV3SCD_OC(EquiformerV3DeNS_OC):
                     targets=tuple(scd_adanorm_targets),
                     scope=scd_adanorm_scope,
                     use_node_feat=scd_adanorm_use_node_feat,
+                    detach_node_feat=scd_adanorm_detach_node_feat,
                 )
 
         self.apply(self._init_weights)
@@ -181,7 +186,7 @@ class EquiformerV3SCD_OC(EquiformerV3DeNS_OC):
                 if emb is not None:
                     emb.weight.requires_grad_(False)
 
-    def _rebuild_blocks_with_adanorm(self, targets, scope, use_node_feat):
+    def _rebuild_blocks_with_adanorm(self, targets, scope, use_node_feat, detach_node_feat):
         """在父类的 block 参数表上做增量，把两处 pre-norm 换成 AdaNorm。
 
         父类 `__init__` 已建好 `self.blocks`，这里按同一份配置重建并追加
@@ -196,6 +201,7 @@ class EquiformerV3SCD_OC(EquiformerV3DeNS_OC):
                 adanorm_targets=targets,
                 adanorm_scope=scope,
                 adanorm_use_node_feat=use_node_feat,
+                adanorm_detach_node_feat=detach_node_feat,
             )
             new_blocks.append(TransBlockV3(**cfg))
         self.blocks = new_blocks

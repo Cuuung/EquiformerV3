@@ -350,7 +350,14 @@ class EquivariantAdaNorm(torch.nn.Module):
     Args:
         scope: 'per_degree' 每个 degree 独立的 scale/gate；'shared' 全 degree 共享；
                'l0_only' 只调制 L=0（对齐参考实现 `dx*gate_x, dvec` 的严格形态）。
-        use_node_feat: 是否把本节点的 L=0 特征（detach）拼进条件 MLP 的输入。
+        use_node_feat: 是否把本节点的 L=0 特征拼进条件 MLP 的输入。参考实现如此
+               （`Linear(2*dim, ...)` 硬编码了这个拼接），但论文正文/附录/Figure 3
+               caption 均未描述这一点。
+        detach_node_feat: 对上述 L=0 特征是否施加 `.detach()`。参考实现恒为 True。
+               **保守力路径必须设 False**：能量通过调制系数依赖坐标，detach 会截断
+               这条路径，使 autograd 的 `-dE/dpos` 不等于真实梯度（有限差分实测偏差
+               比噪声地板高约 600 倍）。直接力预测不受影响。`use_node_feat=False`
+               时本参数无意义。
 
     Returns:
         (x_out, gate)：`x_out` 形状与输入相同；`gate` 是**与 x 广播兼容**的张量，
@@ -371,6 +378,7 @@ class EquivariantAdaNorm(torch.nn.Module):
         cond_channels,
         scope='per_degree',
         use_node_feat=True,
+        detach_node_feat=True,
         eps=1e-5,
         affine=True,
         normalization='component'
@@ -382,6 +390,7 @@ class EquivariantAdaNorm(torch.nn.Module):
         self.cond_channels = cond_channels
         self.scope = scope
         self.use_node_feat = use_node_feat
+        self.detach_node_feat = detach_node_feat
 
         self.norm = get_normalization_layer(
             norm_type, lmax, num_channels, eps, affine, normalization
@@ -414,7 +423,8 @@ class EquivariantAdaNorm(torch.nn.Module):
     def __repr__(self):
         return (f"{self.__class__.__name__}(lmax={self.lmax}, "
                 f"num_channels={self.num_channels}, cond_channels={self.cond_channels}, "
-                f"scope={self.scope}, use_node_feat={self.use_node_feat})")
+                f"scope={self.scope}, use_node_feat={self.use_node_feat}, "
+                f"detach_node_feat={self.detach_node_feat})")
 
     def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
                               missing_keys, unexpected_keys, error_msgs):
@@ -447,7 +457,11 @@ class EquivariantAdaNorm(torch.nn.Module):
             return x, None
 
         if self.use_node_feat:
-            node_feat = x.narrow(1, 0, 1).squeeze(1).detach()
+            node_feat = x.narrow(1, 0, 1).squeeze(1)
+            if self.detach_node_feat:
+                # 参考实现的默认行为。注意这会截断「能量经调制系数依赖坐标」这条
+                # 路径，保守力下 autograd 的 -dE/dpos 不再是真实梯度。
+                node_feat = node_feat.detach()
             inp = torch.cat([cond, node_feat], dim=-1)
         else:
             inp = cond

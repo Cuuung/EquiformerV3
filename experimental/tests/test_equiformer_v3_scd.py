@@ -744,6 +744,46 @@ try:
 except Exception as e:
     check("use_scd=False + scd_freeze_mask_token=True 不报错", False, repr(e))
 
+# ========= detach_node_feat：保守力下 F 是否等于 -dE/dpos（有限差分裁判） =========
+# AdaNorm 的调制系数依赖本节点 L=0 特征。若对该特征施加 detach，能量经调制系数
+# 依赖坐标的那条路径被截断，autograd 的 -dE/dpos 就不是真实梯度。直接力不受影响。
+def _fd_force_gap(detach_node_feat):
+    torch.manual_seed(7)
+    m = build(direct_prediction=False, regress_stress=False,
+              scd_adanorm_detach_node_feat=detach_node_feat)
+    with torch.no_grad():                      # 打破零初始化，否则调制恒等、测不出差别
+        for blk in m.blocks:
+            for nm in (blk.norm_1, blk.norm_2):
+                nm.fc[-1].weight.normal_(0, 0.3)
+                nm.fc[-1].bias.normal_(0, 0.3)
+    m.eval()
+    base = make_batch(n_per=5, n_sys=1, seed=61).pos.clone()
+
+    def energy_at(pos):
+        bb = make_batch(n_per=5, n_sys=1, seed=61)
+        bb.pos = pos.clone()
+        return m(bb)["energy"].sum().item()
+
+    bb = make_batch(n_per=5, n_sys=1, seed=61)
+    bb.pos = base.clone()
+    f_auto = m(bb)["forces"].detach()
+
+    eps, fd = 3e-3, torch.zeros_like(f_auto)
+    for i in range(base.shape[0]):
+        for d in range(3):
+            pp = base.clone(); pp[i, d] += eps
+            pm = base.clone(); pm[i, d] -= eps
+            fd[i, d] = -(energy_at(pp) - energy_at(pm)) / (2 * eps)
+    return (f_auto - fd).abs().max().item()
+
+
+gap_off = _fd_force_gap(detach_node_feat=False)
+gap_on = _fd_force_gap(detach_node_feat=True)
+check("detach_node_feat=False: 保守力与能量自洽（F == -dE/dpos）",
+      gap_off < 1e-3, f"max|F_auto-F_fd|={gap_off:.2e}")
+check("detach_node_feat=True: 复现参考实现的不一致（开关确实生效）",
+      gap_on > 10 * max(gap_off, 1e-9), f"{gap_on:.2e} vs {gap_off:.2e}")
+
 print()
 if FAILURES:
     print(f"FAILED: {len(FAILURES)} -> {FAILURES}")
