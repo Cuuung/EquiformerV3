@@ -298,6 +298,47 @@ def element_embedding_norms(model):
     return out
 
 
+def _element_embedding_weights(model):
+    m = model.module if hasattr(model, 'module') else model
+    m = getattr(m, '_orig_mod', m)
+    return {
+        'sphere': [m.sphere_embedding.weight],
+        'edge_degree': [emb.weight
+                        for emb in (m.edge_degree_embedding.source_embedding,
+                                    m.edge_degree_embedding.target_embedding)
+                        if emb is not None],
+        'blocks': [emb.weight
+                   for block in m.blocks
+                   for emb in (block.ga.source_embedding, block.ga.target_embedding)
+                   if emb is not None],
+    }
+
+
+def element_embedding_snapshot(model):
+    """训练开始时的元素嵌入副本，作为 `element_embedding_drift` 的参考基线。
+
+    注意：从 ckpt 续训时基线是**恢复后**的权重，位移因而是"本次运行以来"的，
+    不是相对随机初始化的。
+    """
+    return {k: [w.detach().clone() for w in ws]
+            for k, ws in _element_embedding_weights(model).items()}
+
+
+def element_embedding_drift(model, ref):
+    """相对基线的位移范数 ‖W - W_ref‖_F，多张表取均值。
+
+    整表 Frobenius 范数（`element_embedding_norms`）被从未取到梯度的行主导
+    ——`max_num_elements=128` 而 MPtrj 只用到约 89 种元素，且用到的也是长尾
+    分布——真实变动被稀释。位移范数让这些死行贡献恒为 0，塌缩时该值趋向
+    ‖W_ref‖ 而非趋向 0。
+    """
+    out = {}
+    for k, ws in _element_embedding_weights(model).items():
+        drifts = [float((w.detach() - r).norm()) for w, r in zip(ws, ref[k])]
+        out['emb_drift_{}'.format(k)] = sum(drifts) / len(drifts) if drifts else 0.0
+    return out
+
+
 @registry.register_trainer("equiformer_v3_dens_trainer")
 class EquiformerV3DeNSTrainer(EquiformerV2ForcesTrainer):
     """
@@ -472,6 +513,11 @@ class EquiformerV3DeNSTrainer(EquiformerV2ForcesTrainer):
         # to prevent inconsistencies due to different batch size in checkpoint.
         start_epoch = self.step // len(self.train_loader)
 
+        # 元素嵌入位移诊断的基线。只有 master rank 记日志，其余 rank 不留副本。
+        self._emb_ref = (
+            element_embedding_snapshot(self.model) if distutils.is_master() else None
+        )
+
         # torch.profiler 探针（env 开关，默认 no-op；仅 master rank）。镜像 esen 的
         # ESEN_PROF：EQV3_PROF=1 开启，schedule(wait/warmup/active) 跳过 compile 未稳的
         # 前若干步，on_trace_ready 打 kernel 表（按 cuda_time_total 排序）+ 存 trace。
@@ -605,6 +651,9 @@ class EquiformerV3DeNSTrainer(EquiformerV2ForcesTrainer):
                     # 避免 master rank 自己每步都算。
                     if self.step % self.config["cmd"]["print_every"] == 0:
                         log_dict.update(element_embedding_norms(self.model))
+                        log_dict.update(
+                            element_embedding_drift(self.model, self._emb_ref)
+                        )
                     self.logger.log(
                         log_dict,
                         step=self.step,
