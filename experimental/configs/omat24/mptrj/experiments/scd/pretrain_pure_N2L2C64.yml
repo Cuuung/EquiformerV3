@@ -1,0 +1,322 @@
+dataset:
+  train:
+    format: ase_db
+    src:
+      - /mnt/afs/share/dataset/periodicSystem/MPtrj/aselmdb/train
+    a2g_args:
+      r_energy: True      # already use `uncorrected_total_energy` after pre-processing
+      r_forces: True
+      r_stress: True
+    transforms:
+      #decompose_tensor:
+      #  tensor: stress
+      #  rank: 2
+      #  decomposition:
+      #    stress_isotropic:
+      #      irrep_dim: 0
+      #    stress_anisotropic:
+      #      irrep_dim: 2
+
+      normalizer:
+        #######################################################################################
+        #   Use either `fit`, `file` or specifying everything
+        #   1.  If loading from a checkpoint, the values from using `fit` will be overwritten
+        #######################################################################################
+        #fit:
+        #  targets:
+        #    energy: { mean: 0.0}
+        #    forces: { mean: 0.0 }
+        #    stress: { mean: 0.0 }
+        #    #stress_isotropic: { }
+        #    #stress_anisotropic: { mean: 0.0 }
+        #  batch_size: 64
+        #  num_batches: 10000
+        #file: experimental/configs/omat24/mptrj/preprocessing/equiformer_v2_mptrj_normalizer.pt
+        energy:
+          mean:     0.0
+          rmsd:     0.8124567446457275    # (1) Following eSEN
+                                          # (2) Remove the division after sum aggregation for energy prediction
+        forces:
+          mean:     0.0
+          rmsd:     0.8124567446457275
+        stress:
+          mean:     0.0
+          rmsd:     0.8124567446457275
+        #isotropic_stress:
+        #  mean:     -0.003037823364138603
+        #  stdev:    0.06647835671901703
+        #anisotropic_stress:
+        #  mean:     0.0
+        #  stdev:    0.026824669912457466
+
+      element_references:
+        #######################################################################################
+        #   Use either `fit` or `file`
+        #   1.  If loading from a checkpoint, the values from using `fit` will be overwritten
+        #######################################################################################
+        #fit:
+        #  targets:
+        #    - energy
+        #  batch_size: 64
+        #  num_batches: 1000
+        #file: experimental/configs/omat24/mptrj/preprocessing/equiformer_v2_mptrj_element_references.pt
+        energy:
+          file: experimental/configs/omat24/mptrj/preprocessing/equiformer_v2_mptrj_energy_element_references.npz
+
+  val:
+    format: ase_db
+    src:
+      - /mnt/afs/share/dataset/periodicSystem/MPtrj/aselmdb/val
+    a2g_args:
+      r_energy: True      # already use `uncorrected_total_energy` after pre-processing
+      r_forces: True
+      r_stress: True
+
+
+trainer:              equiformer_v3_dens_trainer
+
+
+logger:
+  name:               wandb
+  project:            equiformer_v3_mptrj
+
+
+hide_eval_progressbar: False
+
+
+evaluation_metrics:
+  primary_metric: forces_mae
+  metrics:
+    energy:
+      - mae
+      - per_atom_mae
+    forces:
+      - mae
+      - cosine_similarity
+
+
+outputs:
+  energy:
+    level:                system
+    property:             energy
+  forces:
+    level:                atom
+    property:             forces
+    train_on_free_atoms:  True
+    eval_on_free_atoms:   True
+
+
+loss_functions:
+  # 纯 SCD 预训练：唯一的训练信号是去噪损失（forces 那一项在去噪 step 上被
+  # denoising_pos_coefficient 接管，target 换成归一化后的 noise_vec）。
+  - energy:
+      fn:                 per_atom_mae
+      coefficient:        0      # 必须保留此项！系数 0 不贡献损失，但保持
+                                 # energy_block 在 autograd 图中。整项删掉的话
+                                 # 它的 4 个参数会变成 DDP unused param
+                                 # （find_unused_parameters=False 下直接报
+                                 # reduction 错误）—— 已实测确认。
+                                 # 注意：零梯度不等于冻结，解耦权重衰减仍会
+                                 # 让 energy head 缓慢衰减；微调时建议重置它。
+  - forces:
+      fn:                 mse    # 论文式 2 是 MSE；仓库既有配置用 l2mae。
+                                 # 换 fn 会改变梯度尺度，而 repo 的 lr/muon_lr
+                                 # 是在混合 E/F/S 损失下标定的 —— 纯去噪本就是
+                                 # 另一个目标函数，首次运行请观察前 ~500 步，
+                                 # 必要时调 muon_lr 或下方的 denoising 系数。
+      coefficient:        10     # prob=1.0 时本项在去噪 step 上不生效，
+                                 # 实际权重见 denoising_pos_coefficient
+
+
+model:
+  name:                         equiformer_v3_scd
+
+  # ---- SCD v1（自条件去噪，AdaNorm 注入）----
+  use_scd:                      True
+  use_force_cond:               False   # 纯 SCD：条件只来自模型自身对干净结构的嵌入。
+                                        # DeNS 的力条件用的是真实 DFT 力（监督信号），
+                                        # 论文形态的 SCD 不使用它。设 False 会移除
+                                        # force_embedding 子模块（否则它变成 unused param）。
+  scd_inject:                   adanorm # input | adanorm | both
+  scd_adanorm_targets:          ['attn', 'ffn']
+  scd_adanorm_scope:            per_degree   # per_degree | shared | l0_only
+  scd_adanorm_use_node_feat:    True
+  scd_p_dropcond:               0.2
+  scd_cond_clip:                100.0
+  scd_detach_cond:              False
+  scd_reg_noise_std:            0.0     # 论文 0.005，但其材料配置未启用，故默认关
+  scd_freeze_element_embedding: sphere    # none | sphere | sphere_edge | all
+  scd_freeze_mask_token:        False
+
+  use_pbc:                      True
+  use_pbc_single:               True      # Process batch PBC graphs one at a time.
+                                          # This argument is set to True when training on MPtrj.
+  otf_graph:                    True
+
+  regress_forces:               True
+  regress_stress:               False   # 纯 SCD：无 stress 损失，开着会让 stress_block 变 unused param
+  direct_prediction:            True
+
+  max_neighbors:                300
+  max_radius:                   6.0
+  num_radial_basis:             10
+  max_num_elements:             128
+
+  num_layers:                   2
+  num_channels:                 64
+  attn_hidden_channels:         32
+  num_heads:                    8
+  attn_alpha_channels:          64
+  attn_value_channels:          16
+  ffn_hidden_channels:          512
+  norm_type:                    'merge_layer_norm'  # ['sep_layer_norm', 'sep_layer_norm_liger']
+
+  lmax:                         2
+  mmax:                         2
+  attn_grid_resolution_list:    [14,  8]
+  ffn_grid_resolution_list:     [14, 14]
+
+  edge_channels:                128
+  use_atom_edge_embedding:      True
+  use_envelope:                 True
+
+  attn_activation:              'sep-merge_gates2_swiglu'
+  use_attn_renorm:              True
+  use_add_merge:                False
+  use_rad_l_parametrization:    True
+  softcap:                      null
+  ffn_activation:               'sep-merge_gates2_swiglu'
+  use_grid_mlp:                 True
+
+  use_gate_force_head:          True
+
+  alpha_drop:                   0.0
+  attn_mask_rate:               0.0
+  attn_weights_drop:            0.1
+  value_drop:                   0.0
+  drop_path_rate:               0.1     # 论文 Table 17：双前向下 droppath 0.1 提升稳定性。
+                                        # 注意 equiv3 的 GraphDropPath 是 per-graph 丢、
+                                        # 参考实现是 per-node，同数值下本仓库正则更强 —— 第一待调项。
+  proj_drop:                    0.0
+  ffn_drop:                     0.0
+
+  gradient_checkpointing_block_list:    [0, 0]
+
+  enforce_max_neighbors_strictly:       True
+
+  avg_num_nodes:                1       # Remove the division after sum aggregation over nodes for energy prediction
+
+
+optim:
+  batch_size:                   64      # per-GPU; run on 8 GPU -> global 512 (SAME global batch as the proven ratio mlr@1e-3 run, which used 32x16).
+                                        # Keeping global 512 + max_epochs 60 makes steps_per_epoch and the cosine LambdaLR identical to that run,
+                                        # so this is a STEP-FOR-STEP A/B vs ratio-mlr@1e-3 (only the optimizer's update_scale + muon_lr differ).
+                                        # NOTE: launch this config on 8 GPU (set device count = 8 in the job), not 16.
+  grad_accumulation_steps:      1
+  eval_batch_size:              64
+  load_balancing:               atoms
+  num_workers:                  0       # lmdb env not fork-safe -> num_workers>0 segfaults
+  lr_initial:                   0.0002  # AdamW lr for the NON-matrix params (biases, norms, embeddings)
+
+  #####################################################################################
+  #  Muon counterpart of the 60ep AdamW direct config:
+  #    ...epochs@60-bs@64x8-lr@2e-4-wd@1e-3_dens-no-stress_loss-e5-f10-s100.yml
+  #  ===== MOONLIGHT A/B vs the proven ratio mlr@1e-3 run =====================
+  #  This config is identical to ...bs@32x16_hybridmuon-mlr@1e-3...warmup@0.5... EXCEPT:
+  #    (1) optimizer_params.update_scale: "ratio" -> "moonlight"
+  #    (2) optimizer_params.muon_lr:     1e-3     -> 4e-4   (re-calibrated, see below)
+  #    (3) batch_size 32 -> 64 with 8 GPU (instead of 32 with 16 GPU): global batch
+  #        stays 512, so the schedule is bit-identical and the runs are directly comparable.
+  #
+  #  WHY 4e-4 (calibration from the proven ratio-1e-3 run):
+  #  - ratio scale = max(1, rows/cols)**0.5 -> update RMS ~ lr/sqrt(fan_in): SHAPE-DEPENDENT
+  #    (spread ~3x across matrices). moonlight scale = 0.2*sqrt(max(rows,cols)) -> update RMS
+  #    ~0.17*lr for EVERY matrix: shape-INDEPENDENT (this is what makes muon_lr transferable
+  #    across model sizes -- calibrate once, reuse when C / depth / ffn_hidden change).
+  #  - The two modes live on different magnitude scales, so muon_lr MUST be re-calibrated.
+  #    Anchoring to the proven-safe ratio-1e-3 run (measured in-image):
+  #      * match its TYPICAL update RMS (~6.9e-5) -> muon_lr ~4e-4   [chosen: conservative]
+  #      * do-not-exceed bound: keep EVERY matrix <= ratio-1e-3's WORST matrix (per-elem RMS
+  #        ~1.1e-4 / spectral step 2.83e-3) -> muon_lr <= ~6e-4. 4e-4 sits safely under it.
+  #    At 4e-4 the previously limiting matrix (FFN up-proj) updates LESS than under ratio-1e-3;
+  #    the quiet wide matrices update ~2x more (moonlight's equalization) -- watch those early.
+  #    CLI-overridable: --optim.optimizer_params.muon_lr=6e-4 to push toward the upper bound.
+  #
+  #  HybridMuon: Muon (Newton-Schulz orthogonalized momentum) for the weight matrices
+  #  (nn.Linear 2D + SO3Linear 3D), AdamW for biases / norms / embeddings.
+  #  - lr_initial (above) is the AdamW lr applied to the non-matrix params (UNCHANGED at 2e-4).
+  #  - The cosine LambdaLR scales BOTH group lrs by the same multiplier (shared factor that
+  #    cancels in any ratio-vs-moonlight comparison -> calibration is purely about base lr).
+  #  - Under plain DDP this is correct (grads all-reduced before step -> identical Muon
+  #    updates on every rank). Muon's update is norm-normalized, so its per-step magnitude is
+  #    batch-INDEPENDENT: this muon_lr stays valid across card counts as long as global=512.
+  #####################################################################################
+  optimizer:                    HybridMuon
+  optimizer_params:
+    weight_decay:               0.001
+    update_scale:               moonlight # CHANGED "ratio" -> "moonlight": shape-decoupled update scaling 0.2*sqrt(max(rows,cols))
+                                          # (update RMS ~0.17*lr for every matrix). Makes muon_lr ~transferable across model sizes.
+                                          # See the calibration note above; this REQUIRES the re-calibrated muon_lr below.
+    muon_lr:                    0.0004    # CALIBRATED for moonlight (NOT comparable to the ratio mlr). Anchored to the proven-safe
+                                          # ratio-1e-3 60ep run: 4e-4 matches its TYPICAL update RMS (~6.9e-5) and stays under the
+                                          # do-not-exceed bound ~6e-4 (where every matrix would equal ratio-1e-3's worst matrix).
+                                          # CLI-overridable: --optim.optimizer_params.muon_lr=6e-4 to push toward that upper bound.
+    momentum:                   0.95      # Muon momentum
+    nesterov:                   True      # Muon nesterov look-ahead
+    ns_steps:                   5         # Newton-Schulz iterations
+    betas:                      [0.9, 0.95]   # AdamW path
+    eps:                        1.0e-8
+    # --- Muon-side divergence guard [skip-step protection] ----------------------------
+    #  clip_grad_norm is INERT for the Muon group (Newton-Schulz norm-normalizes the
+    #  update, so a global grad-clip cancels out); the only effective Muon protection acts
+    #  on the update itself. DDP-safe (synced grads -> identical skip on every rank).
+    skip_nonfinite:             True   # NaN/Inf grad -> skip the matrix WITHOUT updating its
+                                       #   momentum buffer (breaks the fp16 NaN death-spiral)
+    spike_factor:               8.0    # skip a matrix when its Newton-Schulz-input RMS jumps
+                                       #   >8x its own EMA (self-calibrating; set null to disable)
+    spike_ema_decay:            0.99   # EMA decay for the per-matrix RMS baseline
+    spike_warmup_steps:         200    # no spike-skips until the EMA has stabilized
+    spike_max_consecutive_skips: 25    # deadlock backstop: force-commit + re-baseline a matrix after 25 consecutive skips
+    spike_abs_threshold:        null   # DISABLED for N2L2C64: abs=4.0 is a 30M (deep) tuning; this shallow 2-layer model's natural early
+                                       #   NS-input RMS is ~5-8 (DECREASING as it settles), so 4.0 false-positive aborted both runs @step209
+                                       #   (06-29). 06-17 proved 4e-4 is healthy 60ep WITHOUT this backstop. abs threshold is NOT cross-model
+                                       #   (NS-INPUT = raw momentum RMS, moonlight only normalizes the OUTPUT). skip_nonfinite + 8x-EMA stay on.
+    spike_abs_max_consecutive:  10     # consecutive over-threshold steps before abort
+    log_every:                  200    # master-rank periodic "max NS-input RMS" log (skips always logged)
+  scheduler:                    LambdaLR
+  scheduler_params:
+    lambda_type:                cosine
+    warmup_factor:              0.001   # CHANGED 0.0 -> 1e-3: start at a tiny non-zero lr instead of exactly 0.
+    warmup_epochs:              0.5     # CHANGED 0.1 -> 0.5: longer warmup to ease HybridMuon into full lr.
+    lr_min_factor:              0.01
+
+  max_epochs:                   5    # ABLATION: short 15ep direct (cheap N2L2C64 proxy of the 30M recipe); stage-2 = 5ep gradient-force finetune
+  clip_grad_norm:               100
+  ema_decay:                    0.999
+
+  eval_every:                   5000
+
+  use_denoising_pos:            True    # SCD 自条件生效的必要条件：do_self_cond 依赖
+                                        # denoising_pos_forward，而它只在加噪时置位
+  denoising_pos_params:
+    prob:                       1.0     # SCD 每个 minibatch 都做腐蚀（论文 Algorithm 1），
+                                        # 不是 DeNS 那种「按概率抽一部分 step 做辅助任务」
+    fixed_noise_std:            True
+    std:                        0.04    # 论文 Table 17：所有 SCD 运行（含材料 AMP20）均为 0.04。
+                                        # 仓库其它配置的 0.025 是 DeNS 在 MPtrj 上调的，目标不同。
+                                        # 论文 A.1：0.04 会打乱单/双/三键身份（±0.1 A）但不断键；
+                                        # 明显更大的噪声会损害预训练效果。
+    all_atoms:                  True    # SCD 对全部原子加噪；DeNS 默认只动自由原子。
+                                        # MPtrj 全部原子 fixed=0，两者等价，此处取语义明确。
+    corrupt_ratio:              null    # 全原子腐蚀。corrupt_ratio 是 DeNS 的部分腐蚀特性
+                                        # （一部分原子去噪、另一部分仍拟合真实力），SCD 没有。
+    num_steps:                  50      # not used
+    std_low:                    0.01    # not used
+    std_high:                   0.5     # not used
+    min_num_atoms:              null    # 以下几项都是 DeNS 用来跳过「难」结构的启发式，
+    strict_max_ratio:           null    # SCD 没有。strict_max_ratio 还会 assert
+                                        # corrupt_ratio 非空，必须一并关掉。
+  denoising_pos_coefficient:    1.0     # prob=1.0 时这是唯一生效的损失权重，等价于全局
+                                        # lr 倍数。论文的目标就是纯 MSE、无额外权重。
+
+  use_compile:                  False   # v1 先验证正确性：纯 fp32 eager，不开 amp/tf32/compile
