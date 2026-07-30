@@ -140,12 +140,24 @@ model:
   scd_inject:                   adanorm # input | adanorm | both
   scd_adanorm_targets:          ['attn', 'ffn']
   scd_adanorm_scope:            per_degree   # per_degree | shared | l0_only
-  scd_adanorm_use_node_feat:    True
+  scd_adanorm_use_node_feat:    False   # 调制只由条件向量算出，不看本节点的 L=0 特征。
+                                        # 参考实现是 True（`Linear(2*dim,...)` 硬编码了这个
+                                        # 拼接），但论文正文/附录/Figure 3 caption 均未描述。
+                                        # 设 False 的两个好处：
+                                        #  (1) 调制不依赖 x => 不存在「能量经调制系数依赖坐标」
+                                        #      的路径，保守力下 F = -dE/dpos 自动严格成立，
+                                        #      无需再管 scd_adanorm_detach_node_feat（该开关
+                                        #      在此模式下无效，代码根本不进那个分支）；
+                                        #  (2) 微调阶段 cond 退化为常量 mask token 后，调制变成
+                                        #      全局常量、可折叠进 norm 的 affine —— 于是基线臂与
+                                        #      SCD 臂落在同一函数类，对照实验不会被「AdaNorm 本身
+                                        #      是不是更强的 norm」污染。
+                                        # 代价：预训练期调制只能逐图变化，不能逐节点。
   scd_p_dropcond:               0.2
   scd_cond_clip:                100.0
   scd_detach_cond:              False
   scd_reg_noise_std:            0.0     # 论文 0.005，但其材料配置未启用，故默认关
-  scd_freeze_element_embedding: sphere    # none | sphere | sphere_edge | all
+  scd_freeze_element_embedding: none    # none | sphere | sphere_edge | all
   scd_freeze_mask_token:        False
 
   use_pbc:                      True
@@ -208,11 +220,11 @@ model:
 
 
 optim:
-  batch_size:                   64      # per-GPU; run on 8 GPU -> global 512 (SAME global batch as the proven ratio mlr@1e-3 run, which used 32x16).
+  batch_size:                   32      # per-GPU; run on 8 GPU -> global 512 (SAME global batch as the proven ratio mlr@1e-3 run, which used 32x16).
                                         # Keeping global 512 + max_epochs 60 makes steps_per_epoch and the cosine LambdaLR identical to that run,
                                         # so this is a STEP-FOR-STEP A/B vs ratio-mlr@1e-3 (only the optimizer's update_scale + muon_lr differ).
                                         # NOTE: launch this config on 8 GPU (set device count = 8 in the job), not 16.
-  grad_accumulation_steps:      1
+  grad_accumulation_steps:      2
   eval_batch_size:              64
   load_balancing:               atoms
   num_workers:                  0       # lmdb env not fork-safe -> num_workers>0 segfaults
