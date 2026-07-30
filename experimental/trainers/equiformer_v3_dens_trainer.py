@@ -746,11 +746,17 @@ class EquiformerV3DeNSTrainer(EquiformerV2ForcesTrainer):
                     # we also add noise to and denoise fixed atoms.
                     if self.denoising_pos_params.all_atoms:
                         if hasattr(batch, "noise_mask"):
+                            # 这一支给下面的 hybrid loss 做**逐元素乘法**，需要 [N, 1]
                             mask = mask.view(-1, 1) | noise_mask
                         else:
+                            # 这一支给下面的 `target[mask]` 做**布尔索引**，必须保持 [N]。
+                            # 曾误写为 `.view(-1, 1)`，在 all_atoms=True 且 corrupt_ratio=None
+                            # （即纯 SCD 预训练：全原子加噪、无部分腐蚀）时触发
+                            # IndexError: shape of mask [N,1] does not match indexed
+                            # tensor [N,3]。下方 eval 路径的同名逻辑一直是正确的 [N] 形状。
                             mask = torch.ones_like(
                                 mask, dtype=torch.bool, device=mask.device
-                            ).view(-1, 1)
+                            )
 
                     if hasattr(batch, "noise_mask"):
                         # for partially corrupted structures
