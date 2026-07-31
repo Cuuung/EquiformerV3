@@ -48,3 +48,20 @@ project**; the eval side just appends results in chronological order.
 
 The onboarding prompt handed to the eval-side Claude Code lives at
 `docs/EVAL_SIDE_ONBOARDING_PROMPT.md`.
+
+## Handoff doc upkeep — `docs/HANDOFF.md`
+
+`docs/HANDOFF.md` is the single entry point for whoever takes over this project.
+**Keeping it current is an automatic requirement, not optional:** any time a
+training run finishes or an eval result is filled into `docs/EVAL_REGISTRY.md`,
+updating `HANDOFF.md` is a REQUIRED follow-up in the same task —
+
+- new run submitted → add a line under HANDOFF §5 "进行中/待回填" (+ a `REQUESTED`
+  row in `EVAL_REGISTRY.md`);
+- κ / F1 / RMSD filled (a `DONE` row) → update `docs/Matbench/*_results.md`, move
+  the run out of §5 "待回填", flip §5 status, and update §6 current-best if beaten;
+- a conclusion flips → record it in §4 and the `EVAL_REGISTRY.md` 结论修正区;
+- always bump HANDOFF's "最后更新" date.
+
+The portable version of this upkeep + push discipline (for sibling-project Claude
+Codes, e.g. eval / mlip-forge) lives at `docs/HANDOFF_ONBOARDING_PROMPT.md`.
