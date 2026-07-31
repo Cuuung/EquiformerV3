@@ -1,6 +1,6 @@
-# keller vs moonshot —— N2L2C64 15+5ep Muon 变体消融
+# keller vs moonshot —— N2L2C64 Muon 变体消融
 
-> 日期:2026-07-21 · 口径:5% as-predicted(unique_prototypes F1)+ 全量 103 声子 κ_SRME
+> 初版 2026-07-21 · **干净重测 2026-07-27(本版,取代旧结论)** · 口径:5% as-predicted(unique_prototypes F1)+ 全量 103 声子 κ_SRME
 >
 > **命名约定(全项目别名)**:Muon 是**一个**优化器,`update_scale` 是**一个**参数、有两个取值——
 > **keller ≡ `update_scale="ratio"`**(Keller Jordan 默认缩放 `max(1, rows/cols)**0.5`);
@@ -10,30 +10,48 @@
 
 ---
 
+## ⚠️ 本版重要更正(2026-07-27)
+
+初版(2026-07-21)的 keller 臂用的是 `2026-07-20` 的 ckpt,它的 **direct 基座与 moonshot 臂(消融A)不是同一个** ——
+基座差异被冒充成了"变体增益",导致两条错误印象:**(a)** keller 赢 +0.0168、**(b)** 胜负手是 F1、keller 反而 κ 微输。
+
+2026-07-27 重训了一条**基座对齐**的 keller(`keller_n2l2c64_gradft5ep_from_abl_moonlight15ep`):
+用**消融A 那个 moonlight 15ep direct 基座**,gradft 段唯一变量 `moonshot→keller`(lr 1.5e-4→6.6e-4)。真相是:
+
+- **keller 仍胜,但净增益只有 +0.0047**(不是 +0.0168);
+- **胜负手是 κ_SRME**(keller 0.4459 < moonshot 0.4638),**不是 F1**;
+- **F1 打平**(0.7529 vs 0.7525,噪声内)。初版看到的 F1 +0.0319 全部来自基座差异。
+
+**这条更正把本文档与外部团队的比对从"机制相反"改成"机制一致"**(两边都是 keller 靠 κ 赢、F1 持平)——见 §4。
+
+---
+
 ## TL;DR
 
-- **本轮 N2L2C64 A/B:keller 综合胜出 CPS +0.0168**(0.7470 vs 0.7302)。
-- **但赢在一阶量,不在热导率**:keller 的 F1 高 +0.0319、RMSD 更小,而 **κ_SRME 反而微输**(moonshot κ 略好)。
-- 这与外部非等变团队 ~50M 的结论**殊途同归、机制相反**——他们的 keller 是靠 **κ** 赢、F1 持平;我们的 keller 靠 **F1/RMSD** 赢、κ 微输。→ **"moonshot 损伤高阶 PES 曲率(κ)"的特征在 N2L2C64 这个小模型上没有复现,疑似 size-dependent。**
-- **本 A/B 完全没有测到稳定性轴**:N2L2C64 太小,两臂都不会尾段 runaway。因此外部团队"稳定性来自 weight decay(与缩放正交)、不是来自 moonshot 缩放"的重构,**在本文档里未被检验**,属于 N7L4C128 深模型的问题(见 §5)。
+- **基座对齐后:keller 综合胜出 CPS +0.0047**(0.7349 vs 0.7302),超过 κ 噪声地板(≈0.002)。
+- **赢在热导率,不在一阶量**:keller 的 **κ_SRME 更低 −0.0179**(κₙ +0.0089→CPS +0.0036,胜负手);**F1 打平**(+0.0004);RMSD 微弱更小。
+- 这与外部非等变团队 ~50M 的结论**同方向、且机制也一致**——他们的 keller 也是靠 **κ** 赢、F1 持平。→ **"moonshot 损伤高阶 PES 曲率(κ)"的特征在 N2L2C64 上确实复现了**(初版误判为"没复现/反号",病根是基座污染,不是 size-dependent)。
+- **本 A/B 仍完全没有测到稳定性轴**:N2L2C64 太小,两臂都不会尾段 runaway。外部团队"稳定性来自 weight decay(与缩放正交)"的重构在本文档里**未被检验**,属 N7L4C128 深模型的问题(见 §5)。
 
 ---
 
 ## 1. 目的
 
-在**完全相同**的 N2L2C64 / direct 15ep → grad 5ep / loss e:f:s=5:10:100 配方下,**唯一变量为 `update_scale`**,比较两者综合分 CPS:
+在**完全相同**的 N2L2C64 / direct 15ep → grad 5ep / loss e:f:s=5:10:100 配方、**且同一 direct 基座**下,**唯一变量为 `update_scale`**,比较两者综合分 CPS:
 
 | | keller(`ratio`) | moonshot(`moonlight`) |
 |---|---|---|
-| ckpt 目录 | `2026-07-20-04-01-04-kappaAB_N2L2C64_gradft_5ep_RATIO_mlr6.6e-4_maxatoms150_bs16x8x4_loss-e5f10s100` | `2026-06-29-16-57-36-abl_N2L2C64_gradft_5ep_moonlight_mlr1.5e-4_maxatoms150_bs16x8x4_loss-e5f10s100` |
+| ckpt 目录 | `2026-07-27-07-21-36-keller_N2L2C64_gradft_5ep_RATIO_mlr6.6e-4_from-abl-moonlight15ep-direct_KAPPA-AB` | `2026-06-29-16-57-36-abl_N2L2C64_gradft_5ep_moonlight_mlr1.5e-4_maxatoms150_bs16x8x4_loss-e5f10s100`(消融A) |
+| direct 基座 | **消融A moonlight 15ep(与右列同一基座)** | 消融A moonlight 15ep |
 | `update_scale` | `ratio` | `moonlight` |
 | max learning rate | 6.6e-4 | 1.5e-4 |
 | 家族 | 原生 eqV3-fork(OCPCalculator) | 原生 eqV3-fork(OCPCalculator) |
 
-> lr 不同是**故意匹配**:moonshot 更新 RMS ≈ `0.2·lr` 与形状解耦,keller 更新 RMS = `lr/√fan_in`;二者的等效换算约 2.5×(keller 1e-3 ≈ moonshot 4e-4),所以 keller 6.6e-4 与 moonshot 1.5e-4 属同一档有效步长,不是混淆变量。
-> 两者均为原生 eqV3-fork、测的都是 gradft 段 `best_checkpoint.pt`,声子固定 103 结构、n_overlap=103 有效。
+> lr 不同是**故意匹配**:moonshot 更新 RMS ≈ `0.2·lr` 与形状解耦,keller 更新 RMS = `lr/√fan_in`;二者等效换算约 2.5×,所以 keller 6.6e-4 与 moonshot 1.5e-4 属同一档有效步长,不是混淆变量。
+> **基座对齐是本版相对初版的关键修正**:唯一变量真正落在 `update_scale` 上,不再混入 direct 基座差异。
+> 两者均为原生 eqV3-fork、测的都是 gradft 段 `best_checkpoint.pt`(epoch 5.0,`direct_prediction=False` 铁律通过),声子固定 103 结构、n_overlap=103 有效。
 
-## 2. 分项结果
+## 2. 分项结果(基座对齐)
 
 CPS = 0.5·F1ₙ + 0.4·κ_SRMEₙ + 0.1·RMSDₙ,其中
 F1ₙ=F1;κ_SRMEₙ=max(0, 1−SRME/2);RMSDₙ=clamp((0.15−RMSD)/0.15, 0, 1)。
@@ -41,49 +59,52 @@ F1/RMSD 取 5% as-predicted 的 unique_prototypes 口径;κ_SRME 取全量 103 �
 
 | 分项 | 权重 | **keller(ratio)** | **moonshot(moonlight)** | Δ(keller−moonshot) |
 |---|---|---|---|---|
-| F1 | 0.5 | **0.7844** 🥇 | 0.7525 | **+0.0319** |
-| κ_SRME ↓ | — | 0.4718 | **0.4638** 🥇 | +0.0080 |
-| κ_SRMEₙ | 0.4 | 0.7641 | **0.7681** 🥇 | −0.0040 |
-| RMSD ↓ | — | **0.0763** 🥇 | 0.0800 | −0.0037 |
-| RMSDₙ | 0.1 | **0.4912** 🥇 | 0.4667 | +0.0245 |
-| **CPS** | | **0.7470** 🥇 | 0.7302 | **+0.0168** |
+| F1 | 0.5 | 0.7529 | 0.7525 | **+0.0004**(打平,噪声内) |
+| κ_SRME ↓ | — | **0.4459** 🥇 | 0.4638 | **−0.0179** |
+| κ_SRMEₙ | 0.4 | **0.7770** 🥇 | 0.7681 | **+0.0089** |
+| RMSD ↓ | — | **0.0786** 🥇 | 0.0800 | −0.0014 |
+| RMSDₙ | 0.1 | **0.4761** 🥇 | 0.4667 | +0.0094 |
+| **CPS** | | **0.7349** 🥇 | 0.7302 | **+0.0047** |
 
 **加权贡献拆解:**
 
 | | 0.5·F1 | 0.4·κ_SRMEₙ | 0.1·RMSDₙ | **= CPS** |
 |---|---|---|---|---|
-| keller(ratio) | 0.3922 | 0.3056 | 0.0491 | **0.7470** |
+| keller(ratio) | 0.3765 | 0.3108 | 0.0476 | **0.7349** |
 | moonshot(moonlight) | 0.3763 | 0.3072 | 0.0467 | **0.7302** |
 
-> 备注:若改用 full_test_set F1 口径,两者 F1 = 0.7708 / 0.7445,CPS = 0.7402 / 0.7262,keller 仍胜 +0.0140。本文档主表采用 unique_prototypes 口径以与 CPS 汇总表保持一致。
+**Δ 来源**:κ_SRME **+0.0036**(胜负手)+ RMSD +0.0009 + F1 +0.0002 = **+0.0047**。
 
-## 3. 本轮结论
+> **初版(基座污染)对比留档,作方法学警示**:旧 keller(`muon_ratio_..._2026-07-20` 基座)F1=0.7844、κ=0.4718、RMSD=0.0763、CPS=0.7470;
+> 看着 keller 赢 +0.0168、靠 F1(+0.0319)、κ 微输——**这三点全是基座差异冒充的,基座对齐后消失**。教训:变体消融**必须锁死 direct 基座**,否则一阶量口径会被基座质量主导。
 
-1. **keller(ratio)综合胜出 +0.0168(CPS 0.7470 vs 0.7302)**,明确超过 κ 噪声地板(≈0.002)与 F1 噪声地板(≈0.003)。
-2. **胜负手是一阶量,不是热导率**:
-   - moonshot(moonlight)在 κ_SRME 上微弱领先 0.0080(κₙ +0.0040 → 对 CPS 仅 +0.0016);
-   - 但 keller(ratio)在 **F1 高 0.0319**(权重 0.5 → +0.0160)+ **RMSD 更小**(RMSDₙ +0.0245,权重 0.1 → +0.0025),两项一阶量合计 +0.0185,把 κ 的小劣势彻底盖过。
-3. **物理解读**:Muon-ratio 让能量面/受力(E/F 一阶,决定 F1、RMSD)更准,代价是二三阶曲率(FC2/FC3,决定 κ)几乎持平、略退一点点——净效应对 CPS 为**正向**。
-4. **选型陷阱**:若只看声子会误判成"moonshot 更好";**纳入一阶量后 keller 才是这组 15+5ep 的更优缩放**。
+## 3. 本轮结论(基座对齐)
 
-## 4. 与外部非等变 MLIP 团队的交叉比对(2026-07-21 W30 周报)
+1. **keller(ratio)综合胜出 +0.0047(CPS 0.7349 vs 0.7302)**,超过 κ 噪声地板(≈0.002)。增益小但方向稳。
+2. **胜负手是热导率(κ),不是一阶量**:
+   - keller 在 κ_SRME 上领先 0.0179(κₙ +0.0089 → 对 CPS +0.0036);
+   - F1 打平(+0.0004,权重 0.5 → +0.0002),RMSD 微弱(+0.0094,权重 0.1 → +0.0009)。
+3. **物理解读**:在同一收敛 direct 基座上,keller 的形状感知步长(`lr/√fan_in`)让 gradft 段更好地压平二三阶曲率(FC2/FC3,决定 κ),而一阶量(E/F,决定 F1/RMSD)两臂基本持平。**这与"moonshot 的形状解耦常数步长略伤高阶曲率"一致。**
+4. **选型**:纳入 κ 后 **keller 是这组 15+5ep 的更优缩放**,且赢的来源(κ)与外部团队一致——抬高后续默认选 keller 的先验。
 
-另一支**非等变** MLIP 团队在 ~50M 同尺寸("M")两臂上跑了同样的 keller-vs-moonshot 比较,结论方向一致、机制相反,值得并列。
+## 4. 与外部非等变 MLIP 团队的交叉比对(2026-07-21 W30 周报,本版更新)
 
-| | 本项目 N2L2C64(等变 eqV3) | 外部团队 ~50M(非等变) |
+另一支**非等变** MLIP 团队在 ~50M 同尺寸("M")两臂上跑了同样的 keller-vs-moonshot 比较。**基座对齐重测后,两边结论方向一致、机制也一致**:
+
+| | 本项目 N2L2C64(等变 eqV3,**基座对齐**) | 外部团队 ~50M(非等变) |
 |---|---|---|
-| 谁赢 CPS | **keller** +0.0168 | **keller** ~+0.05 |
-| F1 | keller **高** +0.0319 | 基本持平(0.858 vs 0.863) |
-| κ_SRME | keller **微输**(0.4718 vs 0.4638) | keller **大胜**(0.43 vs 0.68–0.73) |
-| 赢的来源 | **一阶量(F1/RMSD)** | **κ(高阶曲率)** |
+| 谁赢 CPS | **keller** +0.0047 | **keller** ~+0.05 |
+| F1 | **基本持平**(0.7529 vs 0.7525) | 基本持平(0.858 vs 0.863) |
+| κ_SRME | keller **胜**(0.4459 vs 0.4638) | keller **大胜**(0.43 vs 0.68–0.73) |
+| 赢的来源 | **κ(高阶曲率)** | **κ(高阶曲率)** |
 | moonshot 是否带 µP | 否(纯 update_scale 变量) | 是(moonshot+µP,κ 归因不纯) |
 | 稳定性是否触发 | 否(模型太小) | 是(keller 在 ~140M L 失稳) |
 
 **读法:**
 
-1. **"keller ≥ moonshot on CPS" 被两个架构、两个尺度独立确认**——这是稳的结论,抬高我们后续默认选 keller 的先验。
-2. **但"moonshot 损伤 κ"的特征在 N2L2C64 没复现,甚至反号**。最可能的解释是 **size-dependent**:moonshot 的形状解耦步长(`0.2·lr` 常数)要到宽度/深度足够大、矩阵内谱各向异性真正开始主导时,才会开始拖累高阶 PES 曲率。N2L2C64 太小,谱各向异性不足以让这个机制显形。→ **我们自己的大模型 A/B 才是决定性检验,不能拿 N2L2C64 的 κ 反号去否定外部团队。**
-3. 外部团队的 moonshot 臂**捆绑了 µP**,κ 归因不是单变量干净;我们这轮虽是纯 update_scale 变量,但 stage-1 有 lr 起点混淆(ratio 段 @2e-3 未与 1e-3 严格匹配)。**两边都不是无懈可击的单变量,但都指向同一方向。**
+1. **"keller ≥ moonshot on CPS,且赢在 κ" 被两个架构、两个尺度独立确认**——这是稳的结论,抬高我们后续默认选 keller 的先验。
+2. **初版的"机制相反 / moonshot 损伤 κ 在小模型没复现"是错的**,病根是基座污染而非 size-dependent。基座对齐后,N2L2C64 上 keller 同样靠 κ 赢,与外部团队机制一致。**"moonshot 形状解耦步长略伤高阶 PES 曲率"这个特征在小模型也成立**,只是量级小(κ 差 0.0179,vs 外部 ~0.25 的量级差),规模越大越显著。
+3. 外部团队的 moonshot 臂**捆绑了 µP**,κ 归因不是单变量干净;我们这轮是**纯 update_scale 变量、且基座对齐**,归因比外部更干净——**两边都指向同一方向,我们这条是更硬的单变量证据。**
 
 ## 5. weight-decay 重构:本 A/B 未触及的稳定性轴
 
@@ -101,24 +122,26 @@ F1/RMSD 取 5% as-predicted 的 unique_prototypes 口径;κ_SRME 取全量 103 �
 
 ## 6. 下一步消融实验建议(按优先级)
 
-1. **【最高优先·决定性】把这套 A/B 搬到大模型跑一遍(N7L4C128 或能让 moonshot κ 特征显形的尺度)。**
-   目的:验证 §4 的 size-dependent 假设——大模型上 keller 的赢法会不会从"靠 F1"翻转成外部团队的"靠 κ"。这是唯一能把 N2L2C64 的 κ 反号与外部 κ 大胜调和的实验。
+1. **【已部分回答·仍需大模型确认】size-dependent 假设**:初版靠 N2L2C64 的 κ"反号"去质疑外部团队,**已被基座对齐重测证伪**——小模型上 keller 同样靠 κ 赢。剩下的问题不再是"机制会不会翻转",而是"**κ 增益的量级随尺度怎么长**":N2L2C64 只有 0.0179,外部 ~50M 是 ~0.25。**在 N7L4C128 上跑基座对齐的 keller-vs-moonshot,量一量 κ 增益是否随尺度放大**——这才是当前该测的。
+   > 注:现有 30M 的 #1(moonshot)vs #4(keller)**不干净**(#4 混入了 lr 2.4× 变量),不能当这个实验用;要专门补一条 30M 基座对齐、lr 匹配的 keller。
 
 2. **【关键开放问题】矩阵 wd 扫描 0.02 / 0.05 / 0.1,施加在 keller 上,跑 N7L4C128。**
    同时测三样:(a)稳定性(grad-norm 尾段、有没有跑过旧崩溃点);(b)κ_SRME;(c)force MAE 代价。
-   **枢纽问题**:强 wd 在稳住的同时会不会侵蚀 keller 的 κ/一阶优势?外部团队只报了 force +15–20% 的代价,**没报 wd 对 κ 的影响**。要看 **CPS 净值**,并扫出**最小可稳定 wd**——按 [[mp-sota-gap-significance]],15–20% 的 force 退化是灾难级,除非 κ 的 CPS 增益能反超。
+   **枢纽问题**:强 wd 在稳住的同时会不会侵蚀 keller 的 κ/一阶优势?外部团队只报了 force +15–20% 的代价,**没报 wd 对 κ 的影响**。要看 **CPS 净值**,并扫出**最小可稳定 wd**。
 
-3. **【选型默认】把文档层面的"moonshot = 默认"从既定结论降级为"keller + 强 wd 是活跃且可能更优的候选"。**
-   依据:N2L2C64(本轮)+ 外部 ~50M 两个独立证据都是 keller ≥ moonshot on CPS;稳定性可由矩阵 wd 单独买。待 §6.1 大模型 A/B + §6.2 wd 扫描落地后再定稿到 `docs/MUON_PORTING_NOTES.md`。
+3. **【选型默认】"keller + 强 wd 是活跃且可能更优的候选"。**
+   依据:N2L2C64(基座对齐)+ 外部 ~50M 两个独立证据都是 keller ≥ moonshot on CPS 且赢在 κ;稳定性可由矩阵 wd 单独买。待 §6.1 大模型基座对齐 A/B + §6.2 wd 扫描落地后再定稿到 `docs/MUON_PORTING_NOTES.md`。
 
-4. **【便宜的稳健性检查】N2L2C64 keller 的 κ 微劣是否只是噪声?**
-   κ 差 0.0080 vs 噪声地板 ~0.002:量级上是真的,但很小。若换 seed / 换声子子集代价低,补一个重复点,确认 κ 反号是稳的信号而不是单点抖动——这会直接影响 §4.2 的 size-dependent 解读强度。
+4. **【便宜的稳健性检查】N2L2C64 keller 的 κ 优势(0.0179)是否稳?**
+   vs 噪声地板 ~0.002:量级上是真的(~9× 地板),但增益小。若换 seed / 换声子子集代价低,补一个重复点确认信号稳定——这会直接影响 §4 的机制一致性解读强度。
 
 ## 7. 数据溯源
 
-- keller(ratio)弛豫:`.../matbench/relaxation/muon_ratio_n2l2c64_gradft_5ep_e5f10s100/{metrics.json,rmsd.txt}`(2026-07-21 12:08 产出)
-- keller(ratio)声子:`.../matbench/phonon/muon_ratio_n2l2c64_gradft_5ep_e5f10s100/`(SRME=0.4718,n_overlap=103)
-- moonshot(moonlight)弛豫:`.../matbench/relaxation/abl_n2l2c64_gradft_loss-e5f10s100/{metrics.json,rmsd.txt}`
-- moonshot(moonlight)声子:`.../matbench/phonon/abl_n2l2c64_gradft_loss-e5f10s100/`(SRME=0.4638,n_overlap=103)
-- 提交脚本:`Matbench-tools/{relaxation,phonon}/submit_muon_ratio_n2l2c64_gradft_5ep*.sh`、`submit_abl_e5f10s100.sh`
+- **keller(ratio,基座对齐)弛豫**:`.../matbench/relaxation/keller_n2l2c64_gradft5ep_from_abl_moonlight15ep/{metrics.json,rmsd.txt}`(F1=0.7529 unique_prototypes,RMSD=0.07858)
+- **keller(ratio,基座对齐)声子**:`.../matbench/phonon/keller_n2l2c64_gradft5ep_from_abl_moonlight15ep/`(SRME=0.4459,n_overlap=103)
+- moonshot(moonlight,消融A)弛豫:`.../matbench/relaxation/abl_n2l2c64_gradft_loss-e5f10s100/{metrics.json,rmsd.txt}`(F1=0.7525,RMSD=0.07999)
+- moonshot(moonlight,消融A)声子:`.../matbench/phonon/abl_n2l2c64_gradft_loss-e5f10s100/`(SRME=0.4638,n_overlap=103)
+- 提交脚本:`Matbench-tools/{relaxation,phonon}/submit_keller_n2l2c64_gradft5ep_from_abl_moonlight15ep*.sh`、`submit_abl_e5f10s100.sh`
+- **(留档)初版基座污染的 keller**:`.../matbench/{relaxation,phonon}/muon_ratio_n2l2c64_gradft_5ep_e5f10s100/`(2026-07-20 基座,F1=0.7844/κ=0.4718/CPS=0.7470)——**勿再用于变体归因**。
 - 外部团队周报交叉比对来源:记忆 `external-mlip-muon-wd-finding`(W30, 2026-07-21)。
+- CPS 汇总:`Matbench-tools/CPS_RESULTS_FULL_TABLE.md` 表1 #6b(基座对齐)vs #8(消融A)。

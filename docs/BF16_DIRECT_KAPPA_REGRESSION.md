@@ -189,8 +189,68 @@ SRME 分布健康（中位 0.582，46/103 体系 <0.5，仅 1 条完全失败）
 **清理 gradft 精度对 κ 是杯水车薪（只回收约 9%）。要救 κ 必须动 direct 的 bf16 —— §5 的 E1（direct 回 fp32）
 仍是唯一有希望的解药，且现在有了量化依据：不必再在 gradft 侧折腾精度。**
 
+> ⚠️ **后续被 §10 修正**：§10 的 mstack-clean 给出一个**名义上仍是 bf16 direct、κ 却回到好盆地**的反例，
+> 说明"病根是 bf16 本身、只能靠 E1 退回 fp32"这句话下早了——真正的病根疑似是 A0/dpa4 那套**特定** direct 栈里的某个东西，
+> 换成"干净"的 bf16 栈就没了。见 §10。
+
 ### 9.4 ckpt
 
 - EG gradft（被评测，epoch 5.0）：`/mnt/afs/share/checkpoint/equiformerV3/yaolekai/checkpoints/2026-07-24-19-48-16-EG_A0direct-bf16_gradft_5ep_moonshot_FP32-eager/best_checkpoint.pt`
   - direct 基座：同 A0（`2026-07-23-05-30-40-dpa4_A0-baseline_N2L2C64_direct_15ep_moonshot_bf16compile`）
 - 评测口径同 §2（κ 全量 103，n_overlap=103 / n_missing=0）。
+
+---
+
+## 10. 追加（2026-07-27）：mstack-clean —— 一个「干净」的 bf16 direct 栈似乎逃出了 basin
+
+> 这是本议题目前最重要的一条：它可能把 §5/§9 的"bf16 是宿命、只能退回 fp32"结论**整体推翻**。
+> 但**关键变量（mstack-clean 到底改了什么）评测侧看不出来，需训练侧确认**——先把数据摆出来。
+
+### 10.1 设置
+
+被评测的 gradft：`mstack-clean_N2L2C64_gradft_5ep_moonshot_compile-HIGHEST-fp32`
+（moonshot / muon_lr 1.5e-4 / 5ep / e5f10s100 / `enable_compile=True` / `use_amp=False` / **`matmul_precision=highest`（TF32 关）**），
+非 DPA4 臂（三开关全 baseline，剔编译键后 44 键，与纯 baseline 零差异）。
+
+它的 direct 基座是 `2026-07-27-12-41-36-mstack-clean_N2L2C64_direct_15ep_moonshot_bf16compile_BUDGET1`：
+**`use_amp=True` + `enable_compile=True`——名义上就是 bf16+compile，与 A0 的 direct 栈同一套 bf16 设置。**
+
+### 10.2 结果:名义 bf16 direct,κ 却在好盆地
+
+| 线 | direct 基座 | gradft 精度 | **κ_SRME** |
+|---|---|---|---|
+| 消融A | **fp32** | fp32 | 0.4638 |
+| **mstack-clean（本次）** | **bf16compile（"clean" b1.0）** | fp32(highest+compile) | **0.4471** |
+| EG | bf16compile（A0 direct） | fp32(eager) | 0.6579 |
+| A0-baseline | bf16compile（A0 direct） | bf16(compile) | 0.6775 |
+
+**mstack-clean 的 κ=0.4471 落在 fp32 好盆地,甚至略优于消融A 的 fp32 direct(0.4638)——尽管它的 direct 基座名义上是 bf16。**
+
+### 10.3 为什么落差只能归给 direct 栈
+
+- **gradft 精度不是原因**:§9 的 EG 已经夹死这条支路——在 A0 的 bf16 direct 基座上把 gradft 换成全 fp32,κ 只从 0.6775 回收到 0.6579（~9%）。
+- 因此 mstack 从 A0 的 0.6775 跳到 0.4471 的这 **~0.23**,**不可能来自 gradft 精度,只能来自 direct 基座本身**。
+- mstack 与 A0 的 direct 基座都叫 `direct_15ep_moonshot_bf16compile`、`use_amp=True`,**唯一的名义差异是 `mstack-clean` + `BUDGET1`**。
+
+### 10.4 结论（暂定,待训练侧确认一个变量）
+
+**bf16 本身不是 κ 的宿命病根。** 更可能是 A0/dpa4 那套**特定的** direct 栈里某个东西在伤 PES 曲率,
+换成 mstack-clean 的"干净"栈后,即便仍开 bf16 autocast,κ 也回到了 fp32 档。若坐实,这比 §5 的 E1（退回 fp32）**更有价值**——
+因为它保住了 bf16 的训练吞吐,同时拿回 κ。这直接关系到 30M 主力线 `d70g10 bf16`（§7）能否在不牺牲吞吐的前提下再抬 κ。
+
+### 10.5 待澄清 / 缺口（这是能否把"basin 已修复"写死的唯一障碍）
+
+1. **`mstack-clean` + `BUDGET1` 相对 dpa4-A0 的 direct 栈到底改了哪几行?** 两者 config 里 `use_amp`/`enable_compile` 都为 True,
+   评测侧从 ckpt 看不出实质差异。需训练侧点明（是 geometry/Wigner/球谐保 fp32?compile budget 改了数值路径?换了某个 fused 算子?）。
+2. **严格说非单变量**:mstack vs A0 的 direct 基座不同（都叫 bf16compile,但一个 clean 一个不 clean）。但 §10.3 已用 EG 把 gradft 支路夹死,"病根在 direct 栈"的读法成立。
+3. **本实验的设计意图其实是 TF32 隔离**:被评的 `HIGHEST-fp32`（TF32 关）有个孪生 `HIGH-tf32`（TF32 开）,两者**只差 `matmul_precision` 一行**。**孪生臂尚未评**——评了才能给出 gradft 侧 TF32 的单独效应（但注意这是 gradft 侧 TF32,与 §5 的 E2=direct 侧 TF32 不是同一件事）。
+4. **弛豫未完成**,暂无 F1/RMSD/CPS,本节仅 κ。
+
+### 10.6 ckpt / config
+
+- mstack-clean gradft（被评测,epoch 5.0,`direct_prediction=False`）:
+  `.../checkpoints/2026-07-27-20-39-28-mstack-clean_N2L2C64_gradft_5ep_moonshot_compile_HIGHEST-fp32/best_checkpoint.pt`
+  （评测用 patched 版 `.../patched_ckpts/2026-07-27-mstack-clean_N2L2C64_gradft5ep_moonshot_HIGHEST-fp32/`,剔 6 键后 state_dict 逐字节不变）
+- direct 基座:`.../checkpoints/2026-07-27-12-41-36-mstack-clean_N2L2C64_direct_15ep_moonshot_bf16compile_BUDGET1/best_checkpoint.pt`
+- 训练 config:`experimental/configs/omat24/mptrj/experiments/gradient/mstack_baseline/mstack-clean_N@2_L@2_C@64_gradft-5ep_moonshot_compile-HIGHEST-fp32.yml`（其孪生 `..._compile-HIGH-tf32.yml` 为 TF32 开臂）
+- 评测口径同 §2（κ 全量 103,n_overlap=103 / n_missing=0）。
