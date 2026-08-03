@@ -23,6 +23,7 @@ N2L2C64 是廉价消融代理;现有测评**全部 5% 口径**(无全量弛豫)�
 | kappaAB-old | 0.4718 | 0.7844 | 0.0763 | **0.7470** | 07-21 | HybridMuon **keller** / 6.6e-4 | fp32-eager | — | **污染**(06-13 mlr2e-3) | e5f10s100 |
 | **keller-clean** | 0.4459 | 0.7529 | 0.0786 | 0.7349 | 07-28 | HybridMuon **keller** / 6.6e-4 | fp32-eager | — | native | e5f10s100 |
 | mstack-HIGH-tf32 | 0.4448 | 0.7496 | 0.0772 | 0.7344 | 07-29 | HybridMuon moonshot / 1.5e-4 | **compile+HIGH** | 0.6 | bf16-b1.0 | e5f10s100 |
+| mstack-EAGER | 0.4457 | 0.7493 | 0.0776 | 0.7338 | 07-31 | HybridMuon moonshot / 1.5e-4 | **eager**+HIGHEST | — | bf16-b1.0 | e5f10s100 |
 | mstack-HIGHEST | 0.4471 | 0.7488 | 0.0771 | 0.7336 | 07-28 | HybridMuon moonshot / 1.5e-4 | **compile+HIGHEST** | 0.6 | bf16-b1.0 | e5f10s100 |
 | mstack-BUDGET0.8 | 0.4477 | 0.7493 | 0.0776 | 0.7334 | 07-29 | HybridMuon moonshot / 1.5e-4 | compile+HIGHEST | **0.8** | bf16-b1.0 | e5f10s100 |
 | abl-A(基准) | 0.4638 | 0.7525 | 0.0800 | 0.7302 | 06-30 | HybridMuon moonshot / 1.5e-4 | fp32-eager | — | native | e5f10s100 |
@@ -32,16 +33,18 @@ N2L2C64 是廉价消融代理;现有测评**全部 5% 口径**(无全量弛豫)�
 | AdamW-5ep(仅声子) | 0.6062 | — | — | — | 07-08 | AdamW / 5e-5 | fp32-eager | — | AdamW-direct-15ep | e5f10s100 |
 | E-G(仅声子) | 0.6579 | — | — | — | — | HybridMuon moonshot / 1.5e-4 | fp32-eager | — | bf16-b0.6 | e5f10s100 |
 
-## mstack 三胞胎:精度 × budget 干净隔离(同 bf16-b1.0 基座 / compile 恒开 / 同优化器 / 5ep)
+## mstack 四臂:compile × 精度 × budget 干净隔离(同 bf16-b1.0 基座 / 同优化器 / 5ep)
 
-| 对照 | 变量 | κ_SRME | Δκ | 读数 |
+| 对照 | 变量 | κ_SRME | Δκ vs 基准 | 读数 |
 |---|---|---|---|---|
-| HIGHEST-b0.6(基准) | — | 0.4471 | — | 基准 |
-| HIGH-tf32-b0.6 | HIGHEST→**HIGH(TF32)** | 0.4448 | **−0.0023** | TF32 **不伤 κ**(略降,噪声内) |
+| HIGHEST-b0.6(基准) | compile+highest+b0.6 | 0.4471 | — | 基准 |
+| HIGH-tf32-b0.6 | HIGHEST→**HIGH(TF32)** | 0.4448 | −0.0023 | TF32 **不伤 κ** |
 | HIGHEST-b0.8 | budget 0.6→**0.8** | 0.4477 | +0.0006 | fp32 下 budget **κ-中性** |
+| **EAGER-highest** | compile→**关(eager)** | 0.4457 | −0.0014 | **compile 不伤 κ** |
 
-- 三者 κ 跨度仅 0.003(κ 噪声级),MAE 也几乎重合 → **在 N2L2C64,TF32-vs-fp32、budget-0.6-vs-0.8 均 κ-中性**。
-- ⚠️ **推翻旧结论**:此前把 A0(compile+HIGH) vs E-G(eager+HIGHEST) 的 +0.020 记为"TF32 伤 κ",但那对**把 compile 和精度绑在一起**了。本次干净隔离(compile 恒开、仅动精度)显示 TF32 无害 → 那 +0.020 应归 **compile(eager↔编译)**,不是 TF32。详见 `EVAL_REGISTRY.md` 结论修正区。
+- 四臂 κ 跨度仅 0.003(κ 噪声级),MAE 也几乎重合 → **在 N2L2C64,compile、TF32、grad-budget 三者全部 κ-中性**。
+- ⚠️ **推翻旧结论**:此前把 A0(compile+HIGH) vs E-G(eager+HIGHEST) 的 +0.020 记为"TF32/compile 伤 κ",但那对被 direct 基座(b0.6 vs b1.0)污染。本组干净隔离显示 **compile 和 TF32 在 N2L2C64 都无害**。
+- 🔴 **但在 30M 上结论反转**:同一 infra bundle(compile+HIGH+budget0.6)在 30M 使 κ **+0.0265**(见 `N7L4C128_results.md`)——**深度放大,N2L2C64 代理低估了 infra 的 κ 代价**。详见 `EVAL_REGISTRY.md` 结论修正区。
 
 ## 要点
 

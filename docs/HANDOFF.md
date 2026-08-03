@@ -4,7 +4,7 @@
 > 进行中/待办、以及各细分文档与文件的地图。**近期持续维护此文档直到完全交接**——
 > 维护规则见文末《维护说明》。
 >
-> 最后更新:2026-07-31。所有测评数字的唯一真源是 [`EVAL_REGISTRY.md`](EVAL_REGISTRY.md);
+> 最后更新:2026-08-03。所有测评数字的唯一真源是 [`EVAL_REGISTRY.md`](EVAL_REGISTRY.md);
 > 本文档只做导航与解读,数字以 registry 的 `DONE` 行为准。
 
 ---
@@ -12,7 +12,7 @@
 ## 0. 目标与现状一句话
 
 复现 MPtrj-only 的 EquiformerV3,冲 Matbench Discovery(CPS = 0.5·F1 + 0.4·max(0,1−κ_SRME/2) +
-0.1·clamp((0.15−RMSD)/0.15))。**当前最优 30M 模型 CPS 0.8259(全量)/ 0.8326(5%),κ_SRME 0.2764**,
+0.1·clamp((0.15−RMSD)/0.15))。**当前最优 30M 模型 CPS 0.8346(全量)/ 0.8326(5%),κ_SRME 0.2764**,
 距 SOTA 约 1.7% CPS —— 因此 κ / force 上的个位数百分比提升都是显著的,不要当成 wash。
 
 ---
@@ -87,9 +87,11 @@
    → `docs/EQV3_ACT_MEM_BUDGET_direct-misapplication.md` **§4 已被推翻**(它当年说 budget 不影响 MAE/κ)。
 2. **"bf16 direct 伤 κ +0.19" 已被推翻。** 分解为 budget +0.211 / TF32(现已存疑)/ bf16 本身 −0.017。
    核心是 budget bug;**bf16 做对(b1.0)后 direct 反而更好**。→ `docs/BF16_DIRECT_KAPPA_REGRESSION.md` 结论过时。
-3. **"TF32 伤 κ" 已被推翻(2026-07-29)。** 旧证据 A0(compile+TF32) vs E-G(eager+highest) 把 compile 和
-   精度绑一起了。干净三胞胎(同 b1.0 基座、compile 恒开、仅动 matmul)显示 TF32 κ-中性。
-   **那 +0.020 应归 compile,不是 TF32**(compile 净效应本身仍待测)。
+3. **"TF32/compile 伤 κ"在 N2L2C64 已被推翻,但在 30M 反转(深度放大)。** N2L2C64 四臂干净隔离
+   (同 b1.0 基座):compile、TF32、grad-budget **全部 κ-中性**(跨度 0.003)。**然而**同一 maoruicong
+   infra bundle(compile+HIGH+budget0.6)在 **30M 使 κ +0.0265**(旗舰 eager 0.2764 → infra-control 0.3029)。
+   **教训:小模型代理会低估 infra 的 κ 代价;infra 的伤害只在深模显现。** 旗舰之所以最优,正因它 eager-fp32、
+   不上 infra。(30M 尚未拆开 infra 内部是 compile 还是 TF32 还是 budget。)
 
 **通用原则:MAE ⊥ κ。** κ_SRME 是能量面曲率(三阶力常数)的导出量,和 pointwise MAE 解耦。
 精度/budget/compile 这类旋钮常常 MAE 中性但可能动 κ —— **判别力看 κ,不看 MAE**。
@@ -107,23 +109,19 @@
 | **direct budget 0.6 vs 1.0(bf16)** | 1.0 完胜(κ −0.21,forces −16.6%);0.6 是 bug | ✅ 已定 |
 | **grad TF32 vs fp32** | κ-中性(N2L2C64) | ✅ 已定(翻案) |
 | **grad budget 0.6 vs 0.8(fp32)** | κ-中性、MAE 中性 | ✅ 已定 |
-| **grad compile vs eager** | N2L2C64 **MAE 逐位中性**;κ **待回填** | 🟡 κ pending |
+| **grad compile vs eager(N2L2C64)** | κ-中性(eager 0.4457 vs compile 0.4471,−0.0014) | ✅ 已定 |
+| **maoruicong infra bundle @30M** | **+0.0265 伤 κ**(旗舰 eager 0.2764 → infra-control 0.3029);N2L2C64 却中性=**深度放大** | ✅ 已定(关键) |
 | **bf16 direct vs native** | bf16 做对后 κ、MAE 均更优 | ✅ 已定 |
 | **loss e5f10s100 vs e20f20s5** | e5f10s100 更好 | ✅ 已定 |
 | **DPA4 真开关** | κ 灾难(1.3497),暂缓 | ⏸️ 暂停 |
 | **direct base 06-13 mlr2e-3** | MAE 最好但未传导到 κ(未来方向) | 📌 记录 |
-| **30M keller+compile+TF32(0.3086)vs 旗舰(0.2764)** | 更差;归因 **REOPEN**(非 lr、非 TF32;疑 compile / 深度 / 基座) | 🟡 分解中 |
-
-**进行中 / 待回填 κ(pending backfill in EVAL_REGISTRY):**
-- `mstack-clean...EAGER-highest-fp32`(N2L2C64,compile 净效应) — 训练完成、MAE 中性、κ 待测。
-- `moonshot-infra-control...N7L4C128`(30M,moonshot+compile+HIGH+budget0.6,同 STABILIZED-70ep 基座) —
-  训练完成且**健康**(ep2 有能量头再平衡的良性瞬态,非不稳定;forces 0.0269/cos 0.7615),κ 待测。
-  它两条隔离:vs 旗舰=infra 净效应;vs keller-30M=优化器净效应 → 分解 0.3086。
+| **30M keller(0.3086)vs 旗舰(0.2764)** | 分解 = **infra +0.0265(主导)** + 优化器 +0.0057;非 lr、非"TF32 单独" | ✅ 已定 |
 
 **开放问题(接手者优先级):**
-1. **30M keller 未超旗舰的真凶**:等上面两条 30M/N2L2C64 的 κ。若 compile 伤 κ → 30M 要走 keller+**eager**;若 compile 中性 → 查 keller@30M 深度 / STABILIZED-70ep 基座。
-2. **wd=0.1 未测**(外部发现强 wd 助稳定/助 κ)。
-3. **direct base 06-13(更低 MAE)配 κ 保持型 gradft** 未系统试。
+1. **超旗舰的干净路径**:去掉 infra 走 **eager-fp32** + **keller 优化器**(keller@30M-eager 未测;N2L2C64-eager keller −0.018)。⚠️ ~~"keller+compile+highest≈0.258"~~ **作废**:compile-infra 本身伤 κ。
+2. **30M infra 内部拆分**未做(compile / TF32 / budget 各占多少)—— 需再跑,当前按用户要求不做。
+3. **wd=0.1 未测**(外部发现强 wd 助稳定/助 κ)。
+4. **direct base 06-13(更低 MAE)配 κ 保持型 gradft** 未系统试。
 
 ---
 
@@ -133,7 +131,7 @@
 - **ckpt**: `patched_ckpts/2026-07-09-muon_N7L4C128_gradft_10ep_from-adamw-refine_direct_bf16`
 - **配方**: HybridMuon **moonshot** muon_lr 5e-5,**fp32-eager**(无 compile/TF32),10ep(best ep7),loss e5f10s100
 - **direct 基座**: maoruicong **STABILIZED-70ep**(moonlight mlr2e-4,normwd1e-3)
-- **成绩**: κ 0.2764,F1 0.8522(全量)/0.8618(5%),RMSD 0.0674/0.0646,**CPS 0.8259(全量)/0.8326(5%)**
+- **成绩**: κ 0.2764,F1 **0.8696**(全量)/0.8618(5%),RMSD 0.0674/0.0646,**CPS 0.8346(全量)/0.8326(5%)**(全量 F1 为 2026-08-03 更正后的 unique_prototypes 值)
 - 注:**κ 最低另有其人** —— `2026-07-03-...from-adamw-refine`(adamw-refine 基座)κ **0.2665**,但 F1/RMSD 稍逊、综合 CPS 略低(0.8283)。adamw-refine 直连线值得单独跟进。
 
 ### N2L2C64(廉价代理,注意按 epoch 分组比)
