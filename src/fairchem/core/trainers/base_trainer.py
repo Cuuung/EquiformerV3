@@ -10,6 +10,7 @@ from __future__ import annotations
 import copy
 import datetime
 import errno
+import hashlib
 import logging
 import os
 import random
@@ -392,7 +393,41 @@ class BaseTrainer(ABC):
                 )
                 if distutils.is_master():
                     logging.info('Use max_atoms={}'.format(max_atoms))
-            
+
+            # 训练集随机子采样（标签效率实验用）。上游 `create_dataset` 的 sample_n 在本仓库
+            # 被绕过了（见上方被注释掉的调用），故在此按同样语义补上：固定 seed 的 randperm
+            # 取前 sample_n 个。**只作用于 train**，val/test 不受影响，因此两个臂在同一个
+            # 完整 val 上比较。所有 rank 用同一个 seed 跑同一段确定性代码 => 子集逐位一致，
+            # DDP 安全。放在 max_atoms 之后：子集是从过滤后的可用池里抽的。
+            if self.config["dataset"].get("sample_n", None):
+                sample_n = self.config["dataset"]["sample_n"]
+                sample_seed = self.config["dataset"].get("sample_seed", 0)
+                # 用**位置**而非 dataset.indices：max_atoms 已把 train_dataset 包成 Subset 时，
+                # 它的 .indices 是原始数据集空间的 id，而 Subset.__getitem__ 期望的是
+                # 「在内层 Subset 中的位置」。用 arange(len(...)) 两种情况都对。
+                indices = np.arange(len(self.train_dataset), dtype=int)
+                if sample_n > len(indices):
+                    raise ValueError(
+                        f"sample_n={sample_n} > train dataset size {len(indices)}"
+                    )
+                g = torch.Generator()
+                g.manual_seed(sample_seed)
+                indices = indices[torch.randperm(len(indices), generator=g).numpy()][:sample_n]
+                self.train_dataset = Subset(
+                    self.train_dataset,
+                    indices,
+                    metadata=self.train_dataset._metadata
+                )
+                if distutils.is_master():
+                    # 指纹：两次训练的 fp 相同才说明用的是同一批样本。改 max_atoms 或换
+                    # 数据源都会让 len(train_dataset) 变、排列重排，fp 随之改变。
+                    logging.info(
+                        'Use train sample_n={} (seed={}) -> {} samples, fp={} head={}'.format(
+                            sample_n, sample_seed, len(self.train_dataset),
+                            hashlib.md5(indices.tobytes()).hexdigest()[:12],
+                            indices[:5].tolist())
+                    )
+
             self.train_sampler = self.get_sampler(
                 self.train_dataset,
                 self.config["optim"].get("batch_size", 1),
@@ -403,13 +438,13 @@ class BaseTrainer(ABC):
                 self.train_sampler,
             )
 
+        # 注：`sample_n` 已在上面按 train-only 语义显式实现，不在此警告之列。
         if (
             "first_n" in self.config["dataset"]
-            or "sample_n" in self.config["dataset"]
             or "max_atom" in self.config["dataset"]
         ):
             logging.warning(
-                "Dataset attributes (first_n/sample_n/max_atom) passed to all datasets! Please don't do this, its dangerous!\n"
+                "Dataset attributes (first_n/max_atom) passed to all datasets! Please don't do this, its dangerous!\n"
                 + "Add them under each dataset 'train_split_settings'/'val_split_settings'/'test_split_settings'"
             )
 
