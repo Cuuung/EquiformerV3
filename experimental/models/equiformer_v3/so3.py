@@ -346,11 +346,11 @@ class SO3Rotation(torch.nn.Module):
         #wigner = torch.matmul(self.wigner_index_to_m_array, wigner)
         wigner = torch.einsum('mi, nij -> nmj', self.wigner_index_to_m_array, wigner)
         if torch.is_autocast_enabled():
-            wigner = wigner.to(torch.float16)
+            wigner = wigner.to(torch.get_autocast_dtype("cuda"))
         wigner_inv = torch.transpose(wigner, 1, 2).contiguous()
         wigner_inv = wigner_inv * self.wigner_inv_rescale
         if torch.is_autocast_enabled():
-            wigner_inv = wigner_inv.to(torch.float16)
+            wigner_inv = wigner_inv.to(torch.get_autocast_dtype("cuda"))
         self.wigner = wigner            #.detach()
         self.wigner_inv = wigner_inv    #.detach()
 
@@ -368,11 +368,11 @@ class SO3Rotation(torch.nn.Module):
         wigner = eulers_to_wigner(eulers, 0, self.lmax)
         wigner = torch.einsum('mi, nij -> nmj', self.wigner_index_to_m_array, wigner)
         if torch.is_autocast_enabled():
-            wigner = wigner.to(torch.float16)
+            wigner = wigner.to(torch.get_autocast_dtype("cuda"))
         wigner_inv = torch.transpose(wigner, 1, 2).contiguous()
         wigner_inv = wigner_inv * self.wigner_inv_rescale
         if torch.is_autocast_enabled():
-            wigner_inv = wigner_inv.to(torch.float16)
+            wigner_inv = wigner_inv.to(torch.get_autocast_dtype("cuda"))
         # Mirror the old set_wigner detach policy:
         # use_rotation_mask=True  => gradient method  => keep grad
         # use_rotation_mask=False => direct prediction => detach (no grad through rotation)
