@@ -141,8 +141,20 @@ class EquiformerV3SCD_OC(EquiformerV3DeNS_OC):
             torch.nn.init.xavier_uniform_(self.scd_mask_token)
             # 零初始化：初始状态下 SCD 分支恒输出 0，与父类 DeNS 逐位一致，
             # 便于从既有 DeNS ckpt 续训。
-            torch.nn.init.constant_(self.scd_cond_proj.weight, 0.0)
-            torch.nn.init.constant_(self.scd_cond_proj.bias, 0.0)
+            #
+            # **只在 input 路径需要时才做**。纯 adanorm 模式下恒等性已由
+            # `EquivariantAdaNorm` 自己的 fc[-1] 零初始化保证（layer_norm.py:409），
+            # 这里再零初始化就是第二道零门，两者串联会**永久锁死**条件通路：
+            #   前向 cond_proj -> 0  =>  fc 的输入恒为 0
+            #   反向 dL/d fc[-1].weight = delta (x) 输入 = 0  -> fc[-1].weight 卡在 0
+            #        而 fc[-1].weight = 0 又切断通往 cond_proj/cond_head 的梯度
+            # 只有 fc[-1].bias 能动，于是调制退化成与构型无关的常数。
+            # （实测：5 epoch 后 cond_proj.weight 与 fc[3].weight 仍严格为 0，
+            #   条件消融 Δ = 0.00%，即条件完全没起作用。）
+            # 'both' 保留零初始化是安全的：加法注入那条路第一步就给 cond_proj 真实梯度。
+            if self.scd_inject in ('input', 'both'):
+                torch.nn.init.constant_(self.scd_cond_proj.weight, 0.0)
+                torch.nn.init.constant_(self.scd_cond_proj.bias, 0.0)
 
         self._apply_element_embedding_freeze()
 
