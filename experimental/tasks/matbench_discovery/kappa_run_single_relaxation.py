@@ -75,6 +75,8 @@ class KappaSRMERunner:
         # Setup model and calculator
         calculator = OCPCalculator(checkpoint_path=self.checkpoint_path, cpu=False, seed=0)
         calculator.trainer.scaler = None
+        # ckpt 内嵌 config 的 optim.matmul_precision 可能是 high(TF32)，构造时已全局生效 -> 覆盖回纯 fp32
+        torch.set_float32_matmul_precision("highest")
 
         force_results: dict[str, dict[str, Any]] = {}
         kappa_results: dict[str, dict[str, Any]] = {}

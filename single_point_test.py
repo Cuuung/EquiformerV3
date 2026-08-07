@@ -9,6 +9,7 @@ Usage:
 import argparse
 
 import numpy as np
+import torch
 from ase.build import bulk
 
 from fairchem.core import OCPCalculator
@@ -31,6 +32,9 @@ def main() -> None:
     )
     # Disable AMP scaler for clean fp32 inference (matches eval scripts).
     calc.trainer.scaler = None
+    # ckpt 内嵌 config 的 optim.matmul_precision 可能是 high(TF32)，且在 OCPCalculator
+    # 构造时就已全局生效；必须在构造之后覆盖回纯 fp32。
+    torch.set_float32_matmul_precision("highest")
 
     # A small periodic test structure: 2-atom NaCl primitive cell.
     atoms = bulk("NaCl", crystalstructure="rocksalt", a=5.64)

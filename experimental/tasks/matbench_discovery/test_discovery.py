@@ -127,6 +127,9 @@ class RelaxJob(Checkpointable):
         )
         if use_amp is False:  # disable the scaler
             calc.trainer.scaler = None
+            # ckpt 内嵌 config 的 optim.matmul_precision 可能是 high(TF32)，构造时已全局生效
+            # -> 覆盖回纯 fp32，否则 use_amp=False 只关掉了 autocast 这一层
+            torch.set_float32_matmul_precision("highest")
 
         dataset = AseDBDataset(dict(src=str(data_path)))
 

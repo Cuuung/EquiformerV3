@@ -3,6 +3,7 @@ run a relaxation step (conservative forces, fp32)? Mirrors relaxation/run.py."""
 
 import argparse
 import numpy as np
+import torch
 from ase.build import bulk
 from ase.optimize import FIRE
 from ase.filters import FrechetCellFilter
@@ -19,6 +20,8 @@ def main() -> None:
     print(f"[selfcheck] loading: {args.checkpoint}")
     calc = OCPCalculator(checkpoint_path=args.checkpoint, cpu=(args.device == "cpu"), seed=0)
     calc.trainer.scaler = None  # fp32, AMP off (REQUIRED for conservative forces)
+    # ckpt 内嵌 config 的 optim.matmul_precision 可能是 high(TF32)，构造时已全局生效 -> 覆盖回纯 fp32
+    torch.set_float32_matmul_precision("highest")
     print("[selfcheck] OCPCalculator built OK")
 
     # slightly perturbed rocksalt so relaxation has something to do
