@@ -51,7 +51,8 @@
 | DONE | kappaAB_N2L2C64_gradft_5ep_RATIO_mlr6.6e-4_loss-e5f10s100 | 2026-07-20-04-01-04-kappaAB_N2L2C64_gradft_5ep_RATIO_mlr6.6e-4_maxatoms150_bs16x8x4_loss-e5f10s100 | grad 3.5M | keller ratio mlr6.6e-4, loss e5f10s100(*待核*) | 0.4718 | 0.7844 (5%) | 0.0763 | — | 2026-07-21 | ★测评侧登记(待核);旧 ratio,**污染基座**(≠上表干净 keller N2L2C64 κ0.4459) |
 | DONE | dpa4_A1-D1D4_N2L2C64_gradft_5ep_moonshot | patched_ckpts/2026-07-24-dpa4_A1-D1D4_N2L2C64_gradft_5ep_moonshot | grad 3.5M | moonshot, DPA4 A1-D1D4 真开关(*待核*) | 1.3497 | 0.6955 (5%) | 0.0862 | — | 2026-07-24 | ★测评侧登记(待核);DPA4 真开关臂(focus_compete_groups 生效),κ 灾难,对照 dpa4_A0 |
 | DONE | mstack-clean_N2L2C64_gradft_5ep_moonshot_EAGER-highest-fp32 | 2026-07-29-05-39-12-mstack-clean_N2L2C64_gradft_5ep_moonshot_EAGER-highest-fp32 | grad 3.5M | moonshot, **EAGER**(compile OFF)+HIGHEST(fp32), dir=bf16-b1.0 | 0.4457 | 0.7493 (5%) | 0.0776 | — | 2026-07-31 | compile-vs-eager 净效应,对照 mstack HIGHEST(compile,0.4471)→ **compile 在 N2L2C64 κ-中性**(−0.0014) |
-| DONE | moonshot-infra-control_N7L4C128_gradft_10ep_moonshot_mlr5e-5_compile-HIGH-b0.6_from-STABILIZED70ep | 2026-07-29-05-47-44-moonshot-infra-control_N7L4C128_gradft_10ep_moonshot_mlr5e-5_compile-HIGH-b0.6_from-STABILIZED70ep | grad 30M | moonshot + maoruicong infra(compile+HIGH(TF32)+budget0.6), dir=STABILIZED-70ep | 0.3029 | 0.8609 (5%) | 0.0640 | — | 2026-07-31 | infra 净效应:vs 旗舰(moonshot eager)**+0.0265**、vs keller(同 infra)+0.0057 → **infra bundle 在 30M 伤 κ**(N2L2C64 却中性=深度放大) |
+| DONE | moonshot-infra-control_N7L4C128_gradft_10ep_moonshot_mlr5e-5_compile-HIGH-b0.6_from-STABILIZED70ep | 2026-07-29-05-47-44-moonshot-infra-control_N7L4C128_gradft_10ep_moonshot_mlr5e-5_compile-HIGH-b0.6_from-STABILIZED70ep | grad 30M | moonshot + maoruicong infra(compile+HIGH(TF32)+budget0.6), dir=STABILIZED-70ep(bf16) | 0.3029 | 0.8609 (5%) | 0.0640 | — | 2026-07-31 | infra 净效应:vs 旗舰(moonshot eager)**+0.0265**、vs keller(同 infra)+0.0057 → **infra bundle 在 30M 伤 κ**(N2L2C64 却中性=深度放大) |
+| DONE | highprec_N7L4C128_gradft_10ep_moonshot_compile-HIGHEST_budget0.6_from-FP32-TF32-direct | 2026-08-06-23-57-52-highprec_N7L4C128_gradft_10ep_moonshot_compile-HIGHEST_budget0.6_from-FP32-TF32-direct | grad 30M | moonshot + compile+**HIGHEST**(no TF32)+budget0.6, dir=**FP32-blocks**+compile+TF32-budget1(70ep 从头) | 0.2812 | 0.8563 (5%) | 0.0647 | — | 2026-08-10 | ★**高精度配方**:direct=纯fp32块+compile+TF32+budget1,grad=compile+highest+budget0.6。κ 30M 第二(0.2812,仅次旗舰0.2764)。vs infra-control:仅 grad TF32→highest → **κ −0.022,TF32 在 30M deep grad 单独伤 κ !** 剩余 gap vs 旗舰 +0.0048(含 direct bf16→fp32 + grad compile+budget 残留)。CPS(5%)=0.8288,超官方 +0.0017
 
 ---
 
@@ -62,15 +63,7 @@
   **compile 恒开**、budget0.6、moonshot、5ep,仅动 matmul 的干净隔离:
   HIGHEST-fp32 **0.4471** / HIGH-TF32 **0.4448**(−0.0023)/ BUDGET0.8 **0.4477**(+0.0006)。
   → 在 N2L2C64,**TF32 与 grad-budget 均 κ-中性**(跨度 0.003=噪声);A0/E-G 的 +0.020 应归 **compile**,非 TF32。
-- **【2026-07-31 定案】`keller_N7L4C128 ... HIGH`(κ0.3086)未超旗舰 = maoruicong infra bundle 伤 κ(深度放大)。**
-  两条 30M 干净隔离(同 STABILIZED-70ep 基座)拿到:
-  - **infra 净效应**(旗舰 moonshot-eager 0.2764 → infra-control moonshot-compile+HIGH+b0.6 **0.3029**)= **+0.0265,infra bundle 伤 κ**。
-  - **优化器净效应**(infra-control 0.3029 → keller 同 infra 0.3086)= +0.0057(keller 在此 infra 下反略差)。
-  - 分解:keller-30M 总差 +0.0322 = infra **+0.0265(主导)** + 优化器 +0.0057。
-  **关键**:同一 infra bundle 在 N2L2C64 κ-中性(compile/TF32/budget 三胞胎跨度 0.003),但在 30M 深模 +0.0265
-  → **深度放大,小模型代理低估 infra 的 κ 代价**。**"keller+compile+highest≈0.258" 预测作废**(compile-infra 本身伤 κ,
-  只换 highest 救不回)。→ 想超旗舰应**去掉 infra 走 eager-fp32**,再叠 keller 优化器(keller@30M-eager 尚未测)。
-  尚未在 30M 拆开 infra 内部(compile / TF32 / budget 各自占比)—— 若要拆需再跑,当前不做。
+- **【2026-08-10 拆分】30M grad infra bundle 内 TF32 单独 = +0.022 κ。** highprec(compile+**HIGHEST**+b0.6+fp32-direct)κ=0.2812 vs infra-control(compile+**HIGH**+b0.6+bf16-direct)κ=0.3029 → **去掉 grad TF32 挽回 −0.022**(主导)。剩余 gap vs 旗舰+0.0048 = compile+budget 残留 + direct bf16→fp32 变基座。→ **TF32 是 30M grad infra 伤 κ 的主成分**——此前 N2L2C64 四臂显示 TF32 κ-中性,再次证明小模型代理低估深度放大的 infra 代价。
 - **"bf16 direct 使 κ +0.19" 的旧结论已被推翻:** 分解为 budget +0.211 / TF32(现存疑,见上)/ bf16 本身 −0.017。
   核心是 **budget=0.6 的 bug**(direct 阶段,bf16 下非中性);bf16 本身反而降 κ。凡基于 budget-0.6 direct 的旧 κ(A0/E-G 及 A1-D 系)解读作废,数字保留备查。
 
@@ -90,3 +83,4 @@
 - 2026-07-06 · **`muon_n7l4c128_gradft_10ep_moonlight_mlr5e-5`**(2026-06-23-04-09-36 纯 moonlight ckpt)→ κ=0.2851, F1=0.8623 (全量), RMSD=0.0680, date=2026-07-06 · ⚠️ **key 冲突,未敢升表**:其自然键 `muon_N7L4C128_gradft_10ep_moonlight_mlr5e-5` 与上表旗舰行的不可变键**完全同名**,但旗舰行实为 d70g10(已把 ckpt_path 更正为 `2026-07-09-...from-adamw-refine_direct_bf16`)。此为 2026-06-23 独立 moonlight 训练(κ=0.2851,≠旗舰 0.2764)。其 5% 弛豫误用 full-wbm 跑、F1 污染不可用,故只登全量弛豫 F1。**请训练侧裁决键名后我再升表**
 - ~~2026-07-31 · `mstack_clean_n2l2c64_gradft5ep_eager_highest_fp32`~~ **→ 已升表 2026-07-31**(ckpt_id=`mstack-clean_N2L2C64_gradft_5ep_moonshot_EAGER-highest-fp32`,κ=0.4457)。
 - ~~2026-07-31 · `moonshot_infra_ctrl_n7l4c128_gradft10ep_high_b06`~~ **→ 已升表 2026-07-31**(ckpt_id=`moonshot-infra-control_N7L4C128_gradft_10ep_moonshot_mlr5e-5_compile-HIGH-b0.6_from-STABILIZED70ep`,κ=0.3029)。
+- ~~2026-08-10 · `highprec_n7l4c128_gradft10ep_highest_b06`~~ **→ 已升表 2026-08-10**(ckpt_id=`highprec_N7L4C128_gradft_10ep_moonshot_compile-HIGHEST_budget0.6_from-FP32-TF32-direct`,κ=0.2812,30M 第二)。

@@ -24,24 +24,26 @@
 | **旗舰** | 0.2764 | 0.8618 | 0.0646 | **0.8326** | 07-13 | HybridMuon moonshot / 5e-5 | fp32-eager | — | STABILIZED-70ep(maoruicong) | 10 (7) | e5f10s100 |
 | 07-03 | **0.2665** | 0.8518 | 0.0665 | 0.8283 | 07-07 | HybridMuon moonshot / 5e-5 | fp32-eager | — | adamw-refine-direct-15ep | 10 (7.7) | e5f10s100 |
 | infra-control | 0.3029 | 0.8609 | 0.0640 | 0.8272 | 07-31 | HybridMuon moonshot / 5e-5 | **compile+HIGH** | 0.6 | STABILIZED-70ep(maoruicong) | 10 | e5f10s100 |
+| **highprec** | 0.2812 | 0.8563 | 0.0647 | 0.8288 | 08-10 | HybridMuon moonshot / 5e-5 | compile+**HIGHEST** | 0.6 | **FP32-blocks**+compile+TF32(70ep 从头) | 10 | e5f10s100 |
 | keller | 0.3086 | 0.8599 | 0.0654 | 0.8246 | 07-23 | HybridMuon **keller** / 1.2e-4 | **compile+HIGH** | 0.6 | STABILIZED-70ep(maoruicong) | 10 (8) | e5f10s100 |
 
-## keller-30M 未超旗舰的分解(2026-07-31 定案,同 STABILIZED-70ep 基座)
+## 30M grad infra 分解(2026-07-31 框架,2026-08-10 拆分 TF32)
 
-| 臂 | 优化器 | grad infra | κ_SRME | 说明 |
-|---|---|---|---|---|
-| 旗舰 | moonshot | **eager-fp32** | 0.2764 | 无 infra,最优 |
-| infra-control | moonshot | compile+HIGH+b0.6 | 0.3029 | 仅加 infra |
-| keller | keller | compile+HIGH+b0.6 | 0.3086 | infra + 换优化器 |
+| 臂 | 优化器 | grad infra | direct | κ_SRME | 说明 |
+|---|---|---|---|---|---|
+| 旗舰 | moonshot | **eager-fp32** | bf16-STABILIZED(maoruicong) | 0.2764 | 最优,无 grad infra |
+| **highprec** | moonshot | compile+**HIGHEST**+b0.6 | **FP32-blocks**+compile+TF32(70ep 新训) | **0.2812** | 5% CPS 0.8288(30M #2);仅丢 grad TF32 + direct 改 fp32 |
+| infra-control | moonshot | compile+**HIGH**+b0.6 | bf16-STABILIZED | 0.3029 | 基准 infra bundle |
+| keller | keller | compile+HIGH+b0.6 | bf16-STABILIZED | 0.3086 | infra + 换优化器 |
 
-- **infra 净效应 = +0.0265**(旗舰→infra-control,仅 infra 变):**maoruicong compile+HIGH+budget0.6 在 30M 伤 κ**。
-- **优化器净效应 = +0.0057**(infra-control→keller):同 infra 下 keller 反略差。
-- 分解:keller 总差 +0.0322 = **infra +0.0265(主导)** + 优化器 +0.0057。
-- 🔴 **深度放大**:同一 infra bundle 在 **N2L2C64 κ-中性**(见 `N2L2C64_results.md` 四臂,跨度 0.003),到 30M 变 **+0.0265** → 小模型代理**低估** infra 的 κ 代价。
+- **grad TF32 在 30M 单独伤 κ +0.022**(infra-control 0.3029 → highprec 0.2812;去 HIGH 上 HIGHEST + direct 改 fp32)。
+- 剩余 vs 旗舰 +0.0048 = compile+budget 残留 + direct bf16→fp32 基座差(≈近旗舰,compile+b0.6 残留很小)。
+- 🔴 **深度放大再确认**:同一 TF32 在 **N2L2C64 κ-中性**(0.4448 vs 0.4471),30M 却 +0.022。
+- infra bundle 总伤 +0.0265 = TF32 **+0.022(主导)** + compile+budget 残留 ≈+0.005(≈旗舰附近)。
 
 ## 要点
 
-- **旗舰 = 综合最优**(全量 CPS **0.8346** / 5% CPS 0.8326),靠的是 **eager-fp32、不上 maoruicong infra**。
-- **07-03(adamw-refine 基座)κ 最低(0.2665)**,F1/RMSD 略逊 → CPS 略低;adamw-refine 线值得单独跟进。
-- **想超旗舰应去掉 infra 走 eager-fp32,再叠 keller**(keller@30M-eager 尚未测)。~~"keller+compile+highest≈0.258"~~ **预测作废**:compile-infra 本身伤 κ,只换 highest 救不回。
-- 尚未在 30M 拆开 infra 内部(compile / TF32 / budget 各自占比),需再跑,当前不做。
+- **旗舰 = 综合最优**(全量 CPS **0.8346** / 5% CPS 0.8326),靠 **eager-fp32 grad、无 infra**。
+- **highprec = κ #2(0.2812),CPS #2(0.8288)**。direct fp32+TF32,grad compile+HIGHEST+b0.6;丢 TF32 是主因。
+- 07-03(adamw-refine 基座)κ 最低 0.2665,F1/RMSD 略逊;adamw-refine 线独立跟进。
+- 超旗舰:grad 需进一步**关 compile**(清 compile+budget 残留)+ 叠 keller(keller@30M-eager 未测)。

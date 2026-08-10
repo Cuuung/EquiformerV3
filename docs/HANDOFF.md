@@ -4,7 +4,7 @@
 > 进行中/待办、以及各细分文档与文件的地图。**近期持续维护此文档直到完全交接**——
 > 维护规则见文末《维护说明》。
 >
-> 最后更新:2026-08-03。所有测评数字的唯一真源是 [`EVAL_REGISTRY.md`](EVAL_REGISTRY.md);
+> 最后更新:2026-08-10。所有测评数字的唯一真源是 [`EVAL_REGISTRY.md`](EVAL_REGISTRY.md);
 > 本文档只做导航与解读,数字以 registry 的 `DONE` 行为准。
 
 ---
@@ -110,7 +110,7 @@
 | **grad TF32 vs fp32** | κ-中性(N2L2C64) | ✅ 已定(翻案) |
 | **grad budget 0.6 vs 0.8(fp32)** | κ-中性、MAE 中性 | ✅ 已定 |
 | **grad compile vs eager(N2L2C64)** | κ-中性(eager 0.4457 vs compile 0.4471,−0.0014) | ✅ 已定 |
-| **maoruicong infra bundle @30M** | **+0.0265 伤 κ**(旗舰 eager 0.2764 → infra-control 0.3029);N2L2C64 却中性=**深度放大** | ✅ 已定(关键) |
+| **maoruicong infra bundle @30M** | grad TF32 是主因 **+0.022**(highprec 0.2812 vs infra-control 0.3029);compile+budget 残留≈+0.005;N2L2C64 却中性=**深度放大** | ✅ **已拆分**(2026-08-10) |
 | **bf16 direct vs native** | bf16 做对后 κ、MAE 均更优 | ✅ 已定 |
 | **loss e5f10s100 vs e20f20s5** | e5f10s100 更好 | ✅ 已定 |
 | **DPA4 真开关** | κ 灾难(1.3497),暂缓 | ⏸️ 暂停 |
@@ -118,10 +118,11 @@
 | **30M keller(0.3086)vs 旗舰(0.2764)** | 分解 = **infra +0.0265(主导)** + 优化器 +0.0057;非 lr、非"TF32 单独" | ✅ 已定 |
 
 **开放问题(接手者优先级):**
-1. **超旗舰的干净路径**:去掉 infra 走 **eager-fp32** + **keller 优化器**(keller@30M-eager 未测;N2L2C64-eager keller −0.018)。⚠️ ~~"keller+compile+highest≈0.258"~~ **作废**:compile-infra 本身伤 κ。
-2. **30M infra 内部拆分**未做(compile / TF32 / budget 各占多少)—— 需再跑,当前按用户要求不做。
+1. **超旗舰的干净路径**:去掉 grad infra 走 **eager-fp32** + **keller 优化器**(keller@30M-eager 未测;N2L2C64-eager keller −0.018)。~~"keller+compile+highest≈0.258"~~ **作废**。
+2. ~~30M infra 内部拆分~~ **→ TF32 已拆分(+0.022,主因)**;compile+budget 残留 +0.0048 近旗舰,拆分价值不大。
 3. **wd=0.1 未测**(外部发现强 wd 助稳定/助 κ)。
 4. **direct base 06-13(更低 MAE)配 κ 保持型 gradft** 未系统试。
+5. **direct FP32-blocks 基座可复用**(highprec 新训的 70ep fp32 direct → 可接不同 grad 配方测 direct bf16→fp32 的净效应)。
 
 ---
 
@@ -132,7 +133,7 @@
 - **配方**: HybridMuon **moonshot** muon_lr 5e-5,**fp32-eager**(无 compile/TF32),10ep(best ep7),loss e5f10s100
 - **direct 基座**: maoruicong **STABILIZED-70ep**(moonlight mlr2e-4,normwd1e-3)
 - **成绩**: κ 0.2764,F1 **0.8696**(全量)/0.8618(5%),RMSD 0.0674/0.0646,**CPS 0.8346(全量)/0.8326(5%)**(全量 F1 为 2026-08-03 更正后的 unique_prototypes 值)
-- 注:**κ 最低另有其人** —— `2026-07-03-...from-adamw-refine`(adamw-refine 基座)κ **0.2665**,但 F1/RMSD 稍逊、综合 CPS 略低(0.8283)。adamw-refine 直连线值得单独跟进。
+- 注:**κ 最低另有其人** —— `2026-07-03-...from-adamw-refine`(adamw-refine 基座)κ **0.2665**;**κ #2 为 highprec(0.2812,CPS #2 0.8288)**, direct=FP32-blocks+compile+TF32,grad=compile+HIGHEST+b0.6。adamw-refine 线值得单独跟进。
 
 ### N2L2C64(廉价代理,注意按 epoch 分组比)
 - 100ep 组最优:`muon_N2L2C64_gradft_40ep_mlr1e-3`(direct60+gradft40)κ 0.3662,CPS **0.7773**。
