@@ -189,7 +189,7 @@ model:
   proj_drop:                    0.0
   ffn_drop:                     0.0
 
-  gradient_checkpointing_block_list:    [1, 1, 1, 1, 1, 1, 1]   # length == num_layers (7). ON for the 30M model:
+  gradient_checkpointing_block_list:    [0, 0, 0, 0, 0, 0, 0]   # length == num_layers (7). ON for the 30M model:
                                                                 # fp32 double-backward gradient force is the heaviest stage,
                                                                 # checkpointing keeps per-GPU batch at 32 (global 512) without OOM.
 
