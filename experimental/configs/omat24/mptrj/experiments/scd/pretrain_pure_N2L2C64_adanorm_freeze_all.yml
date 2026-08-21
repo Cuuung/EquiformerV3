@@ -157,7 +157,7 @@ model:
   scd_cond_clip:                100.0
   scd_detach_cond:              False
   scd_reg_noise_std:            0.0     # 论文 0.005，但其材料配置未启用，故默认关
-  scd_freeze_element_embedding: none    # none | sphere | sphere_edge | all
+  scd_freeze_element_embedding: all    # none | sphere | sphere_edge | all
   scd_freeze_mask_token:        False
 
   use_pbc:                      True

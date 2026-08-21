@@ -137,7 +137,7 @@ model:
                                         # DeNS 的力条件用的是真实 DFT 力（监督信号），
                                         # 论文形态的 SCD 不使用它。设 False 会移除
                                         # force_embedding 子模块（否则它变成 unused param）。
-  scd_inject:                   adanorm # input | adanorm | both
+  scd_inject:                   input # input | adanorm | both
   scd_adanorm_targets:          ['attn', 'ffn']
   scd_adanorm_scope:            per_degree   # per_degree | shared | l0_only
   scd_adanorm_use_node_feat:    False   # 调制只由条件向量算出，不看本节点的 L=0 特征。

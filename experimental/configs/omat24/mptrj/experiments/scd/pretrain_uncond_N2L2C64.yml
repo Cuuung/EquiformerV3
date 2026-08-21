@@ -1,0 +1,264 @@
+########################################################################################
+#  0 号对照臂：**无条件去噪**预训练（no self-conditioning），5 epoch。
+#
+#  本文件 = pretrain_pure_N2L2C64.yml 只改一处实质：use_scd: True -> False
+#  （连带删掉 scd_inject / scd_adanorm_* / scd_p_dropcond / scd_cond_clip /
+#    scd_detach_cond / scd_reg_noise_std / scd_freeze_mask_token —— use_scd=False 时
+#    这些全部惰性，留着只是死键）。其余逐字相同 -> 与 SCD 各臂 step-for-step 可比。
+#
+#  ===== 这一臂要回答什么 =============================================================
+#  SCD 的对照矩阵少的就是下限：
+#    0  本文件               无条件去噪                    <- 下限
+#    1  scd_inject: input     自条件，加性注入
+#    2  scd_inject: adanorm   自条件，乘性调制
+#    3  use_force_cond: True  真实力条件（DeNS）            <- 「条件有用」的上限参照
+#  判读：0 ≈ 1 ≈ 2 => 自条件在这个规模上不起作用，直接报无条件去噪；
+#        0 <  1 ≈ 2 => 条件有用但注入形式不敏感，选 input（更简单、不重建 block）；
+#        0 <  1 <  2 => adanorm 的乘性调制确实有额外收益。
+#
+#  ===== 代码层面确认「确实是无条件」（逐条核对 equiformer_v3_scd.py）================
+#    :125      use_scd=False -> 条件链路整体不创建（scd_cond_head / scd_mask_token /
+#              scd_cond_norm / scd_cond_proj），AdaNorm 重建也嵌在这个 if 里（:131），
+#              blocks 保持父类原样。DDP 也因此没有 unused param（见 :121-124 注释）。
+#    :252-253  _scd_cond_vector 立即 return None
+#    :323      input 注入被 `if self.use_scd and ...` 短路
+#    :320      use_force_cond=False -> force_embedding = torch.zeros(())，到
+#              equiformer_v3_dens.py:303 的 `x = x + force_embedding` 等于加 0
+#  => 模型只看到噪声结构，dens_block 照常产出噪声预测。
+#  ⚠ test_equiformer_v3_scd.py 没有 use_scd=False 的用例，这条路径无测试覆盖，
+#    第一次跑先 smoke 几百步。
+#
+#  ===== 算力不对等（报结果时必须说明）================================================
+#  SCD 臂每个去噪 step 多跑一次 clean 前向（约 2x 前向）。本臂同步数下只用了约一半算力。
+#  严格对比建议同时给两个点：
+#    等步数：本文件原样（5 ep）
+#    等算力：--optim.max_epochs=10
+#  否则「SCD 更好」可能只是「训得更久」。
+########################################################################################
+
+dataset:
+  train:
+    format: ase_db
+    src:
+      - /mnt/afs/share/dataset/periodicSystem/MPtrj/aselmdb/train
+    a2g_args:
+      r_energy: True      # already use `uncorrected_total_energy` after pre-processing
+      r_forces: True
+      r_stress: True
+    transforms:
+      normalizer:
+        energy:
+          mean:     0.0
+          rmsd:     0.8124567446457275    # (1) Following eSEN
+                                          # (2) Remove the division after sum aggregation for energy prediction
+        forces:
+          mean:     0.0
+          rmsd:     0.8124567446457275
+        stress:
+          mean:     0.0
+          rmsd:     0.8124567446457275
+
+      element_references:
+        energy:
+          file: experimental/configs/omat24/mptrj/preprocessing/equiformer_v2_mptrj_energy_element_references.npz
+
+  val:
+    format: ase_db
+    src:
+      - /mnt/afs/share/dataset/periodicSystem/MPtrj/aselmdb/val
+    a2g_args:
+      r_energy: True      # already use `uncorrected_total_energy` after pre-processing
+      r_forces: True
+      r_stress: True
+
+
+trainer:              equiformer_v3_dens_trainer
+
+
+logger:
+  name:               wandb
+  project:            equiformer_v3_mptrj
+
+
+hide_eval_progressbar: False
+
+
+evaluation_metrics:
+  primary_metric: forces_mae
+  metrics:
+    energy:
+      - mae
+      - per_atom_mae
+    forces:
+      - mae
+      - cosine_similarity
+
+
+outputs:
+  energy:
+    level:                system
+    property:             energy
+  forces:
+    level:                atom
+    property:             forces
+    train_on_free_atoms:  True
+    eval_on_free_atoms:   True
+
+
+loss_functions:
+  # 纯去噪预训练：唯一的训练信号是去噪损失（forces 那一项在去噪 step 上被
+  # denoising_pos_coefficient 接管，target 换成归一化后的 noise_vec）。
+  - energy:
+      fn:                 per_atom_mae
+      coefficient:        0      # 必须保留此项！系数 0 不贡献损失，但保持 energy_block
+                                 # 在 autograd 图中。整项删掉的话它的 4 个参数会变成 DDP
+                                 # unused param（find_unused_parameters=False 下直接报
+                                 # reduction 错误）—— 已实测确认。
+  - forces:
+      fn:                 mse    # 与 SCD 各臂一致（论文式 2 是 MSE）。换 fn 会改变梯度尺度，
+                                 # 跨臂对比必须保持相同。
+      coefficient:        10     # prob=1.0 时本项在去噪 step 上不生效，
+                                 # 实际权重见 denoising_pos_coefficient
+
+
+model:
+  name:                         equiformer_v3_scd
+
+  # ---- 无条件：关掉自条件与力条件两条通路 ----
+  use_scd:                      False   # ★ 本文件与 SCD 各臂的唯一实质差异。
+                                        # 条件链路不创建，blocks 不重建 -> 结构上等同父类 DeNS。
+                                        # 注意 ckpt 里因此没有任何 scd_* / norm_?.fc.* 键：
+                                        # 下游微调必须用**不带 adanorm** 的配置
+                                        # （scd_inject: input 那份，或裸 equiformer_v3_dens），
+                                        # 否则 AdaNorm 那套会静默随机初始化。
+  use_force_cond:               False   # 不使用 DeNS 的真实力条件。设 False 会移除
+                                        # force_embedding 子模块（否则它变成 unused param）。
+                                        # 想跑 3 号上限参照臂就把这里改 True。
+  scd_freeze_element_embedding: sphere_edge    # none | sphere | sphere_edge | all
+                                        # 与 SCD 各臂保持同档 —— 冻结档位会显著影响
+                                        # emb_norm_* 曲线，跨臂不一致就没法归因。
+                                        # 本项在 use_scd=False 时仍然生效
+                                        # （_apply_element_embedding_freeze 无条件调用）。
+
+  use_pbc:                      True
+  use_pbc_single:               True      # Process batch PBC graphs one at a time.
+                                          # This argument is set to True when training on MPtrj.
+  otf_graph:                    True
+
+  regress_forces:               True
+  regress_stress:               False   # 纯去噪：无 stress 损失，开着会让 stress_block 变 unused param
+  direct_prediction:            True
+
+  max_neighbors:                300
+  max_radius:                   6.0
+  num_radial_basis:             10
+  max_num_elements:             128
+
+  num_layers:                   2
+  num_channels:                 64
+  attn_hidden_channels:         32
+  num_heads:                    8
+  attn_alpha_channels:          64
+  attn_value_channels:          16
+  ffn_hidden_channels:          512
+  norm_type:                    'merge_layer_norm'  # ['sep_layer_norm', 'sep_layer_norm_liger']
+
+  lmax:                         2
+  mmax:                         2
+  attn_grid_resolution_list:    [14,  8]
+  ffn_grid_resolution_list:     [14, 14]
+
+  edge_channels:                128
+  use_atom_edge_embedding:      True
+  use_envelope:                 True
+
+  attn_activation:              'sep-merge_gates2_swiglu'
+  use_attn_renorm:              True
+  use_add_merge:                False
+  use_rad_l_parametrization:    True
+  softcap:                      null
+  ffn_activation:               'sep-merge_gates2_swiglu'
+  use_grid_mlp:                 True
+
+  use_gate_force_head:          True
+
+  alpha_drop:                   0.0
+  attn_mask_rate:               0.0
+  attn_weights_drop:            0.1
+  value_drop:                   0.0
+  drop_path_rate:               0.1     # 与 SCD 各臂保持一致以求 A/B 干净。注意它的原始理由
+                                        # （论文 Table 17：双前向下 droppath 0.1 更稳）在本臂
+                                        # **不成立**（无 clean 前向）；若本臂欠拟合，这是第一待调项，
+                                        # 但调了就不再是严格 A/B。
+  proj_drop:                    0.0
+  ffn_drop:                     0.0
+
+  gradient_checkpointing_block_list:    [0, 0]
+
+  enforce_max_neighbors_strictly:       True
+
+  avg_num_nodes:                1       # Remove the division after sum aggregation over nodes for energy prediction
+
+
+optim:
+  batch_size:                   32      # per-GPU; 8 GPU x 32 x accum2 -> global 512（与 SCD 各臂同）
+  grad_accumulation_steps:      2
+  eval_batch_size:              64
+  load_balancing:               atoms
+  num_workers:                  0       # lmdb env not fork-safe -> num_workers>0 segfaults
+  lr_initial:                   0.0002  # AdamW lr for the NON-matrix params (biases, norms, embeddings)
+
+  #####################################################################################
+  #  HybridMuon + moonlight 标定（update RMS ~0.17*lr，shape 无关），muon_lr 4e-4。
+  #  完整标定推导见 pretrain_pure_N2L2C64.yml 文件内同段注释；跨臂必须保持同值。
+  #####################################################################################
+  optimizer:                    HybridMuon
+  optimizer_params:
+    weight_decay:               0.001
+    update_scale:               moonlight
+    muon_lr:                    0.0004    # CLI 可覆盖 --optim.optimizer_params.muon_lr=6e-4
+    momentum:                   0.95      # Muon momentum
+    nesterov:                   True      # Muon nesterov look-ahead
+    ns_steps:                   5         # Newton-Schulz iterations
+    betas:                      [0.9, 0.95]   # AdamW path
+    eps:                        1.0e-8
+    # --- Muon-side divergence guard [skip-step protection] ----------------------------
+    skip_nonfinite:             True   # NaN/Inf grad -> skip the matrix WITHOUT updating its
+                                       #   momentum buffer (breaks the fp16 NaN death-spiral)
+    spike_factor:               8.0    # skip a matrix when its Newton-Schulz-input RMS jumps
+                                       #   >8x its own EMA (self-calibrating; set null to disable)
+    spike_ema_decay:            0.99   # EMA decay for the per-matrix RMS baseline
+    spike_warmup_steps:         200    # no spike-skips until the EMA has stabilized
+    spike_max_consecutive_skips: 25    # deadlock backstop: force-commit + re-baseline a matrix after 25 consecutive skips
+    spike_abs_threshold:        null   # N2L2C64 上 abs=4.0 是 30M（深模型）的调法，会误杀
+    spike_abs_max_consecutive:  10     # consecutive over-threshold steps before abort
+    log_every:                  200    # master-rank periodic "max NS-input RMS" log (skips always logged)
+  scheduler:                    LambdaLR
+  scheduler_params:
+    lambda_type:                cosine
+    warmup_factor:              0.001
+    warmup_epochs:              0.5
+    lr_min_factor:              0.01
+
+  max_epochs:                   5     # 等步数对照。等算力的第二个点用 --optim.max_epochs=10
+  clip_grad_norm:               100
+  ema_decay:                    0.999
+
+  eval_every:                   50000
+  checkpoint_every:             3000     # 与 eval_every 解耦：不写的话默认取 eval_every
+
+  use_denoising_pos:            True
+  denoising_pos_params:
+    prob:                       1.0     # 每个 minibatch 都做腐蚀，与 SCD 各臂一致
+    fixed_noise_std:            True
+    std:                        0.04    # 与 SCD 各臂一致（论文 Table 17）
+    all_atoms:                  True    # 全原子加噪；MPtrj 全原子 fixed=0
+    corrupt_ratio:              null    # 全原子腐蚀，不做 DeNS 式部分腐蚀
+    num_steps:                  50      # not used
+    std_low:                    0.01    # not used
+    std_high:                   0.5     # not used
+    min_num_atoms:              null    # 以下两项是 DeNS 用来跳过「难」结构的启发式，此处关闭。
+    strict_max_ratio:           null    # strict_max_ratio 还会 assert corrupt_ratio 非空
+  denoising_pos_coefficient:    1.0     # prob=1.0 时这是唯一生效的损失权重
+
+  use_compile:                  False   # 与 SCD 各臂一致：纯 fp32 eager，不开 amp/tf32/compile
