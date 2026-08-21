@@ -1,0 +1,43 @@
+# EquiformerV3 compile 镜像的腾讯云 TiOne 适配层。
+#
+# 继承本地 equiformer_v3:compile，仅按 TiOne 开发机自定义镜像规范
+# （https://cloud.tencent.cn/document/product/851/86695）新增：
+#   openssh-server / jupyterlab / /opt/dl/run 启动脚本 / tini entrypoint
+#   + RDMA 用户态库（多机 NCCL 走 RoCE/IB，不退化到 TCP）
+#   + Nsight Systems（nsys profiler，跟随 CUDA 12.8）
+# 并把 WORKDIR、PYTHONPATH 从 afs 路径改为 CFS 路径（平台把 CFS 挂到
+# /home/tione/notebook，仓库放 /home/tione/notebook/repositories/equiformer_v3）。
+#
+# Build: docker build -t equiformer_v3:tione - < Dockerfile.tione
+FROM equiformer_v3:compile
+
+# openssh-server/tini：TiOne 规范；rdma-core 系列：RDMA 用户态栈（内核态 mlx5/gdrdrv 由宿主机
+# 提供，容器只需用户态库）。ibverbs-providers 含 mlx5 provider——NCCL 识别 Mellanox 网卡的关键；
+# ibverbs-utils 提供 ibv_devinfo/ibv_devices 用于进容器自检网卡是否可见。
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        openssh-server tini \
+        rdma-core libibverbs1 librdmacm1 ibverbs-providers ibverbs-utils \
+    && mkdir -p /var/run/sshd \
+    && rm -rf /var/lib/apt/lists/*
+
+# Nsight Systems（nsys）：从基础镜像已配置的 NVIDIA CUDA 源装，跟随 CUDA 12.8。
+# 附带的 X/Qt 库是 host GUI(nsys-ui) 依赖，容器内只用 CLI(nsys profile)，装着无害。
+# nsys 装在 /opt/nvidia/nsight-systems/<ver>/ 下，版本目录名随包变，故动态建 symlink
+# 到 /usr/local/bin（已在 PATH），避免写死版本号；末尾 --version 作构建期自检。
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        cuda-nsight-systems-12-8 \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf "$(find /opt/nvidia/nsight-systems -type f -name nsys | head -1)" /usr/local/bin/nsys \
+    && nsys --version
+
+RUN pip install --no-cache-dir jupyterlab
+
+# TiOne 开发机启动入口：平台以 ENTRYPOINT 起容器后执行 /opt/dl/run 拉起 JupyterLab
+RUN mkdir -p /opt/dl \
+    && printf '#!/bin/bash\ncd /home/tione/notebook && jupyter lab --allow-root --no-browser --ip=0.0.0.0 --port=8888 --notebook-dir=/home/tione/notebook --NotebookApp.allow_origin='"'"'*'"'"' --NotebookApp.token='"''"'\n' > /opt/dl/run \
+    && chmod a+x /opt/dl/run
+
+WORKDIR /home/tione/notebook/repositories/equiformer_v3
+ENV PYTHONPATH=/home/tione/notebook/repositories/equiformer_v3/src:/home/tione/notebook/repositories/equiformer_v3
+
+ENTRYPOINT ["/usr/bin/tini", "-g", "--"]
