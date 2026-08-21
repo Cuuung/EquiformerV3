@@ -1,0 +1,293 @@
+########################################################################################
+#  Stage-2（直接力版）· **input 注入臂**: 从 scd_inject=input 的 SCD 预训练 ckpt 接
+#  direct-force 监督微调，15 epoch。
+#  Stage-1 = scd/pretrain_pure_N2L2C64.yml 改 scd_inject: input
+#            （对应 ckpt: N2L2C64_scd_input_freeze_none）
+#
+#  本文件 = N2L2C64_scd_direct-finetune_bf16-tf32-encompile.yml（adanorm 臂）
+#  只改两处：
+#    (1) scd_inject: adanorm -> input
+#    (2) 删掉 scd_adanorm_targets / scope / use_node_feat / detach_node_feat
+#        （input 模式下 blocks 不重建，这四项不参与建模）
+#  其余逐字相同 -> 两个注入臂之间也是干净 A/B。
+#
+#  ★★ 为什么必须单独一份，不能拿 adanorm 那份配 input 的 ckpt ★★
+#  两种注入的 block 内 norm **键名结构不同**（已解包两个 ckpt 核对）：
+#      input   ckpt:  blocks.0.norm_1.affine_weight            <- 裸 norm
+#      adanorm ckpt:  blocks.0.norm_1.norm.affine_weight       <- 被 AdaNorm 包一层
+#                     blocks.0.norm_1.fc.{0,2,3}.{weight,bias} <- 调制头
+#  用 adanorm 配置加载 input ckpt 时：ckpt 的 norm_1.affine_* 在模型里不存在 -> 打 log 跳过；
+#  模型的 norm_1.norm.affine_* 和整套 norm_1.fc.* 在 ckpt 里没有 -> **静默保持随机初始化**
+#  （equiformer_v3_dens_trainer.py:1316-1321 只对「ckpt 有、模型没有」打 log，反方向不打）。
+#  结果是每个 block 两处 pre-norm affine 全随机 + 调制头全随机，跑得起来但不是 input 臂的微调。
+#  => 自查方法：看 log 里 `... in the checkpoint but not in the state_dict of model`。
+#     本配置正常加载时只该跳过 stress_block 之类的预期项，不该出现成片的 norm_1/norm_2。
+#
+#  ===== 精度/编译档位：bf16 + TF32 + enable_compile ===================================
+#  与 adanorm 臂完全相同，完整论证见 N2L2C64_scd_direct-finetune_bf16-tf32-encompile.yml
+#  文件头。input 模式下有一点比 adanorm 臂更稳：force_embedding 不再是 0 维标量，而是
+#  _scd_cond_embedding 产出的 [N, (lmax+1)^2, C] 节点级张量（equiformer_v3_scd.py:326），
+#  作为 torch.compile 入参是最普通的情形；test_equiformer_v3_scd.py:330 覆盖了
+#  scd_inject=input + enable_compile（compile_dynamic=False）。
+#  compile_dynamic=True 仍未覆盖，建议先跑几百步 smoke。
+#  optim.amp(fp16+GradScaler) 必须保持关闭：与 model.use_amp 互斥，trainer 会直接报错。
+########################################################################################
+
+dataset:
+  train:
+    format: ase_db
+    src:
+      - /mnt/afs/share/dataset/periodicSystem/MPtrj/aselmdb/train
+    a2g_args:
+      r_energy: True      # already use `uncorrected_total_energy` after pre-processing
+      r_forces: True
+      r_stress: True
+    transforms:
+      normalizer:
+        energy:
+          mean:     0.0
+          rmsd:     0.8124567446457275    # (1) Following eSEN
+                                          # (2) Remove the division after sum aggregation for energy prediction
+        forces:
+          mean:     0.0
+          rmsd:     0.8124567446457275
+        stress:
+          mean:     0.0
+          rmsd:     0.8124567446457275
+
+      element_references:
+        energy:
+          file: experimental/configs/omat24/mptrj/preprocessing/equiformer_v2_mptrj_energy_element_references.npz
+
+  val:
+    format: ase_db
+    src:
+      - /mnt/afs/share/dataset/periodicSystem/MPtrj/aselmdb/val
+    a2g_args:
+      r_energy: True      # already use `uncorrected_total_energy` after pre-processing
+      r_forces: True
+      r_stress: True
+
+
+trainer:              equiformer_v3_dens_trainer
+
+
+logger:
+  name:               wandb
+  project:            equiformer_v3_mptrj
+
+
+hide_eval_progressbar: False
+
+
+evaluation_metrics:
+  primary_metric: forces_mae
+  metrics:
+    energy:
+      - mae
+      - per_atom_mae
+    forces:
+      - mae
+      - cosine_similarity
+    stress:
+      - mae
+
+
+outputs:
+  energy:
+    level:                system
+    property:             energy
+  forces:
+    level:                atom
+    property:             forces
+    train_on_free_atoms:  True
+    eval_on_free_atoms:   True
+  stress:
+    level:                system
+    property:             stress
+
+
+loss_functions:
+  - energy:
+      fn:                 per_atom_mae
+      coefficient:        5      # E:F:S = 5:10:100，与对照臂一致
+  - forces:
+      fn:                 l2mae
+      coefficient:        10
+  - stress:
+      fn:                 mae
+      coefficient:        100
+
+
+model:
+  name:                         equiformer_v3_scd
+
+  # ---- SCD 开关：与 stage-1（input 臂）对齐 ----
+  use_scd:                      True    # 必须 True，否则 scd_cond_head/mask_token/cond_proj
+                                        # 根本不创建（equiformer_v3_scd.py:125），ckpt 里的
+                                        # scd_* 全部落空
+  use_force_cond:               False   # 与 stage-1 一致。ckpt 里没有 force_embedding.* 键，
+                                        # 设 True 会凭空造一个随机初始化的空转模块
+  scd_inject:                   input   # ★ 本文件与 adanorm 臂的唯一实质差异。
+                                        # cond 写进 L=0 通道加到第 0 层节点嵌入上
+                                        # （equiformer_v3_scd.py:326），blocks 不重建 ->
+                                        # norm_1/norm_2 保持裸 norm，键名与 stage-1 一致。
+                                        # 注意：input 模式下 scd_adanorm_* 四项不参与建模，
+                                        # 故本文件不写，写了也只是死键。
+  scd_p_dropcond:               0.2     # 微调期 do_self_cond 恒 False，本项与 cond_clip 均不生效，
+  scd_cond_clip:                100.0   # 保留只为与 stage-1 对齐、便于 diff
+  scd_detach_cond:              False
+  scd_reg_noise_std:            0.0
+  scd_freeze_element_embedding: none    # 有意与 stage-1 不同：冻结是为了防预训练期嵌入塌缩，
+                                        # 监督微调阶段应放开。只改 requires_grad、不改形状
+                                        # => 不影响 ckpt 加载。
+  scd_freeze_mask_token:        False   # 微调期 cond 恒等于 mask_token，它会持续收到真实梯度
+
+  use_pbc:                      True
+  use_pbc_single:               True      # Process batch PBC graphs one at a time.
+                                          # This argument is set to True when training on MPtrj.
+  otf_graph:                    True
+
+  regress_forces:               True
+  regress_stress:               True
+  direct_prediction:            True    # 直接力：force_block / stress_block 独立输出头
+                                        # （非 -dE/dpos），无双反向
+
+  max_neighbors:                300
+  max_radius:                   6.0
+  num_radial_basis:             10
+  max_num_elements:             128
+
+  num_layers:                   2
+  num_channels:                 64
+  attn_hidden_channels:         32
+  num_heads:                    8
+  attn_alpha_channels:          64
+  attn_value_channels:          16
+  ffn_hidden_channels:          512
+  norm_type:                    'merge_layer_norm'  # ['sep_layer_norm', 'sep_layer_norm_liger']
+
+  lmax:                         2
+  mmax:                         2
+  attn_grid_resolution_list:    [14,  8]
+  ffn_grid_resolution_list:     [14, 14]
+
+  edge_channels:                128
+  use_atom_edge_embedding:      True
+  use_envelope:                 True
+
+  attn_activation:              'sep-merge_gates2_swiglu'
+  use_attn_renorm:              True
+  use_add_merge:                False
+  use_rad_l_parametrization:    True
+  softcap:                      null
+  ffn_activation:               'sep-merge_gates2_swiglu'
+  use_grid_mlp:                 True
+
+  use_gate_force_head:          True
+
+  alpha_drop:                   0.0
+  attn_mask_rate:               0.0
+  attn_weights_drop:            0.1     # 与对照臂一致（15ep 完整训练，保留正则）
+  value_drop:                   0.0
+  drop_path_rate:               0.05    # 与对照臂一致。stage-1 用的是 0.1（双前向下更需要），
+                                        # 这里回到对照臂的 0.05 以保证 A/B 干净。dropout 无权重，
+                                        # 与 ckpt 加载无关。
+  proj_drop:                    0.0
+  ffn_drop:                     0.0
+
+  enable_compile:               True    # in-model plain_compile(core_compute)；与 optim.use_compile 互斥
+  compile_dynamic:              True    # dynamic=True：动态 shape，否则每种 shape 重编译
+  use_amp:                      True    # 块级 bf16 autocast（无 GradScaler）；与 optim.amp/fp16 互斥
+
+  gradient_checkpointing_block_list:    [0, 0]      # length == num_layers；显存紧张改 [1, 1]
+
+  enforce_max_neighbors_strictly:       True
+
+  avg_num_nodes:                1       # Remove the division after sum aggregation over nodes for energy prediction
+
+
+optim:
+  batch_size:                   64      # per-GPU；8 GPU -> global 512（与对照臂同）
+  grad_accumulation_steps:      1
+  eval_batch_size:              64
+  load_balancing:               atoms
+  num_workers:                  0       # lmdb env not fork-safe -> num_workers>0 segfaults
+  lr_initial:                   0.0002  # AdamW lr for the NON-matrix params (biases, norms, embeddings)
+
+  matmul_precision:             high    # TF32：加速 fp32 matmul（默认 highest = 纯 fp32）。
+                                        # 与 bf16 正交，只影响剩下的 fp32 matmul。
+
+  #####################################################################################
+  #  与对照臂同一套 moonlight 标定（update RMS ~0.17*lr，shape 无关）。
+  #  这里刻意**不**下调 lr：虽然 backbone 是预训练的，但 E/F/S 三个头都等价于随机初始化
+  #  （见文末 load_pretrained_weights 说明），用 finetune 级的小 lr 反而学不动头。
+  #  若观察到 backbone 被冲坏（前 ~500 步 forces_mae 先降后反弹），把 muon_lr 降到 2e-4。
+  #####################################################################################
+  optimizer:                    HybridMuon
+  optimizer_params:
+    weight_decay:               0.001
+    update_scale:               moonlight
+    muon_lr:                    0.0004    # 与对照臂一致；CLI 可覆盖 --optim.optimizer_params.muon_lr=2e-4
+    momentum:                   0.95
+    nesterov:                   True
+    ns_steps:                   5
+    betas:                      [0.9, 0.95]
+    eps:                        1.0e-8
+    # --- Muon-side divergence guard [skip-step protection] ---------------------------
+    skip_nonfinite:             True
+    spike_factor:               8.0
+    spike_ema_decay:            0.99
+    spike_warmup_steps:         200
+    spike_max_consecutive_skips: 25
+    spike_abs_threshold:        null   # N2L2C64 上 abs=4.0 是 30M 的调法，会误杀
+    spike_abs_max_consecutive:  10
+    log_every:                  200
+  scheduler:                    LambdaLR
+  scheduler_params:
+    lambda_type:                cosine
+    warmup_factor:              0.001
+    warmup_epochs:              0.5
+    lr_min_factor:              0.01
+
+  max_epochs:                   15
+  clip_grad_norm:               100
+  ema_decay:                    0.999
+
+  eval_every:                   5000
+
+  use_denoising_pos:            False   # 监督微调，不做去噪辅助任务。
+                                        # 副作用（DDP 安全，已核对）：dens_block 仍被构造并前向，
+                                        # 但输出被全零 noise_mask 吃掉 -> 零梯度而非无梯度；
+                                        # scd_cond_head 同理靠 `0.0 * ...` 留在图里
+                                        # （equiformer_v3_scd.py:271-275）。两者都不会触发
+                                        # find_unused_parameters=False 的 reduction 错误。
+  denoising_pos_params:                 # use_denoising_pos=False 时全部惰性，但 trainer 会
+    prob:                       0.0     # 无条件 DenoisingPosParams(**...) 解析，故必须存在
+    fixed_noise_std:            True    # trainer 断言必须为 True
+    std:                        0.04
+    corrupt_ratio:              null
+    all_atoms:                  True
+    num_steps:                  50
+    std_low:                    0.01
+    std_high:                   0.5
+    min_num_atoms:              null
+    strict_max_ratio:           null
+  denoising_pos_coefficient:    1.0
+
+  use_compile:                  False   # 外层老 torch.compile 关闭（与 model.enable_compile 互斥，
+                                        # trainer._setup_compile 同开会直接报错）
+
+  ######################################################################################
+  #  Stage-1（input 臂）ckpt 由 CLI 指定：
+  #    --optim.load_pretrained_weights=<N2L2C64_scd_input_* 的 best_checkpoint.pt>
+  #
+  #  预期迁移情况（与 adanorm 臂同理，差别只在 norm 那一层）：
+  #    backbone / blocks.*.norm_?.affine_* / dens_block / scd_cond_head/mask_token/
+  #      cond_norm/cond_proj  -> 全部迁移
+  #    energy_block.* / force_block.*  -> ckpt 有，会被加载，但在 stage-1 里都是零梯度的
+  #      （energy 系数 0；force_block 输出被全 True 的 noise_mask 乘成 0）=> ≈ 随机初始化
+  #    stress_block.*  -> ckpt 无（stage-1 regress_stress=False），本配置会随机初始化
+  #  综合：backbone 预训练，E/F/S 三个头都是新的 —— 开局 stress 损失（系数 100）会很大，
+  #  warmup 0.5ep 已考虑此点。
+  ######################################################################################

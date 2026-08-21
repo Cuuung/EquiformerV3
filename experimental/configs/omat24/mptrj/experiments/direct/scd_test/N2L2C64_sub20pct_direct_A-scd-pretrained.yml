@@ -1,0 +1,301 @@
+########################################################################################
+#  标签效率对照实验 · A 臂：SCD 全集预训练 -> 20% 子集直接力监督微调
+#  B 臂（对照）：N2L2C64_sub20pct_direct_B-scratch.yml
+#
+#  两个 yml **除 load_pretrained_weights 一行外语义完全相同**。改任何一处都要同步改
+#  另一份，否则对照实验失效。校验：
+#    diff <(sed 's/[[:space:]]*#.*$//' N2L2C64_sub20pct_direct_A-scd-pretrained.yml) \
+#         <(sed 's/[[:space:]]*#.*$//' N2L2C64_sub20pct_direct_B-scratch.yml)
+#  应当只有末尾那一处差异。
+#
+#  ===== 实验设计 ====================================================================
+#  问题：SCD 在**无标签**数据上的预训练，能否提升标签稀缺时的监督效果？
+#  A 臂：stage-1 SCD 在全部 1,420,395 帧上做纯去噪预训练（不用任何标签，见下）
+#        -> stage-2 在固定的 20% 子集（284,079 帧）上做 direct-force 监督训练
+#  B 臂：同一架构随机初始化 -> 直接在同一个 20% 子集上做 direct-force 监督训练
+#  两臂的子集由 dataset.sample_n + dataset.sample_seed 确定，逐位相同。
+#
+#  「无标签」是可核验的：stage-1 config(pretrain_pure_N2L2C64.yml) 里
+#    - energy 损失 coefficient = 0
+#    - forces 的 target 被换成噪声向量（denoising_pos_forward 分支）
+#    - regress_stress = False，无 stress 损失
+#    - use_force_cond = False   -> DeNS 的「真实力条件」通道被移除
+#    - denoising_pos_params 里 max_force_norm / max_stress_norm / max_mean_force_norm
+#      全为 null -> 连「用标签筛样本」都没有
+#  => 标签确实从未进入 stage-1 的任何计算路径。
+#
+#  ===== 子集机制 ====================================================================
+#  dataset.sample_n / dataset.sample_seed 是本次为该实验补上的（上游 fairchem 的
+#  create_dataset 在本仓库被绕过，见 base_trainer.py load_datasets 里被注释掉的调用）。
+#  实现位置：src/fairchem/core/trainers/base_trainer.py，max_atoms 之后。
+#  语义：固定 seed 的 randperm 取前 sample_n 个；**只作用于 train**，
+#  val / test 不受影响 -> 两臂都在完整的 158,367 帧 val 上评测。
+#  所有 rank 跑同一段确定性代码 => 子集逐位一致，DDP 安全。
+#
+#  可复现性：用的是独立的 torch.Generator（不读全局 RNG），故不受 --seed / dataloader
+#  worker / 之前任何 manual_seed 影响。同一个 sample_seed + 同样的 len(train_dataset)
+#  => 每次跑都是同一批样本。又因为 indices 是 arange，取前 N 个 = 同一排列的前缀，
+#  所以不同档位的子集是**嵌套**的：1% ⊂ 5% ⊂ 20%。
+#  ⚠ 加 max_atoms 会改变 len(train_dataset)，整个排列随之改变，嵌套关系与可比性都会断。
+#  本文件刻意不设 max_atoms。
+#
+#  ===== 步数预算（重要）=============================================================
+#  全局 batch 512，20% 子集 = 284,079 帧 -> 554.8 step/epoch。
+#  若沿用全集配置的 max_epochs=15，只有 ~8.3k 步；这里给到 40 epoch ≈ 22k 步，
+#  与 5%/1% 档的步数预算拉平，两臂完全相同。
+#  真正的比较点是 best_checkpoint（primary_metric = 完整 val 上的 forces_mae）。
+#
+#  标签效率曲线的其它档位（sample_seed 保持 0 不变，只改这 4 个数）：
+#    1%   sample_n:  14204   max_epochs: 750   warmup_epochs: 25    eval_every: 500
+#    5%   sample_n:  71020   max_epochs: 150   warmup_epochs:  5    eval_every: 1000
+#    20%  sample_n: 284079   max_epochs:  40   warmup_epochs:  1.5  eval_every: 2000  <- 本文件
+#    100% 即 N2L2C64_scd_direct-finetune_bf16-tf32-encompile.yml（15ep），预期两臂差距趋近 0
+#
+#  精度/编译档位（bf16 + TF32 + enable_compile）的完整论证见
+#  N2L2C64_scd_direct-finetune_bf16-tf32-encompile.yml 文件头，此处不重复。
+#  换 stage-1 臂时必须同步 scd_adanorm_use_node_feat 等键，对照表同样见该文件。
+########################################################################################
+
+dataset:
+  train:
+    format: ase_db
+    src:
+      - /mnt/afs/share/dataset/periodicSystem/MPtrj/aselmdb/train
+    a2g_args:
+      r_energy: True      # already use `uncorrected_total_energy` after pre-processing
+      r_forces: True
+      r_stress: True
+
+    sample_n:       284079  # 20% of 1,420,395。两臂必须相同。
+    sample_seed:    0       # 两臂必须相同 —— 这两行决定了「同一个子集」
+
+    transforms:
+      normalizer:
+        energy:
+          mean:     0.0
+          rmsd:     0.8124567446457275    # (1) Following eSEN
+                                          # (2) Remove the division after sum aggregation for energy prediction
+        forces:
+          mean:     0.0
+          rmsd:     0.8124567446457275
+        stress:
+          mean:     0.0
+          rmsd:     0.8124567446457275
+
+      element_references:
+        energy:
+          file: experimental/configs/omat24/mptrj/preprocessing/equiformer_v2_mptrj_energy_element_references.npz
+
+  val:
+    format: ase_db
+    src:
+      - /mnt/afs/share/dataset/periodicSystem/MPtrj/aselmdb/val
+    a2g_args:
+      r_energy: True      # already use `uncorrected_total_energy` after pre-processing
+      r_forces: True
+      r_stress: True
+
+
+trainer:              equiformer_v3_dens_trainer
+
+
+logger:
+  name:               wandb
+  project:            equiformer_v3_mptrj
+
+
+hide_eval_progressbar: False
+
+
+evaluation_metrics:
+  primary_metric: forces_mae
+  metrics:
+    energy:
+      - mae
+      - per_atom_mae
+    forces:
+      - mae
+      - cosine_similarity
+    stress:
+      - mae
+
+
+outputs:
+  energy:
+    level:                system
+    property:             energy
+  forces:
+    level:                atom
+    property:             forces
+    train_on_free_atoms:  True
+    eval_on_free_atoms:   True
+  stress:
+    level:                system
+    property:             stress
+
+
+loss_functions:
+  - energy:
+      fn:                 per_atom_mae
+      coefficient:        5      # E:F:S = 5:10:100
+  - forces:
+      fn:                 l2mae
+      coefficient:        10
+  - stress:
+      fn:                 mae
+      coefficient:        100
+
+
+model:
+  ######################################################################################
+  #  两臂共用**完全相同**的架构（含 AdaNorm），只差是否加载 stage-1 权重。
+  #  这样才不会把「SCD 预训练的收益」和「AdaNorm 这个结构本身的收益」混在一起。
+  #  本臂 scd_adanorm_use_node_feat=False，微调期 cond 恒为常量 mask_token =>
+  #  AdaNorm 退化成全局常量调制、可折叠进 norm 的 affine，与普通 norm 同一函数类，
+  #  这个对照因此是干净的。
+  ######################################################################################
+  name:                         equiformer_v3_scd
+
+  use_scd:                      True
+  use_force_cond:               False
+  scd_inject:                   adanorm
+  scd_adanorm_targets:          ['attn', 'ffn']
+  scd_adanorm_scope:            per_degree
+  scd_adanorm_use_node_feat:    False   # 必须与 stage-1（freeze_sphere 臂）一致，否则 fc[0] 形状对不上
+  scd_adanorm_detach_node_feat: False   # use_node_feat=False 时惰性；direct 路径下本就无正确性影响
+  scd_p_dropcond:               0.2     # 微调期不生效（do_self_cond 恒 False），保留以便与 stage-1 diff
+  scd_cond_clip:                100.0
+  scd_detach_cond:              False
+  scd_reg_noise_std:            0.0
+  scd_freeze_element_embedding: none    # 监督微调阶段放开；只改 requires_grad，不影响加载
+  scd_freeze_mask_token:        False
+
+  use_pbc:                      True
+  use_pbc_single:               True      # Process batch PBC graphs one at a time.
+                                          # This argument is set to True when training on MPtrj.
+  otf_graph:                    True
+
+  regress_forces:               True
+  regress_stress:               True
+  direct_prediction:            True
+
+  max_neighbors:                300
+  max_radius:                   6.0
+  num_radial_basis:             10
+  max_num_elements:             128
+
+  num_layers:                   2
+  num_channels:                 64
+  attn_hidden_channels:         32
+  num_heads:                    8
+  attn_alpha_channels:          64
+  attn_value_channels:          16
+  ffn_hidden_channels:          512
+  norm_type:                    'merge_layer_norm'
+
+  lmax:                         2
+  mmax:                         2
+  attn_grid_resolution_list:    [14,  8]
+  ffn_grid_resolution_list:     [14, 14]
+
+  edge_channels:                128
+  use_atom_edge_embedding:      True
+  use_envelope:                 True
+
+  attn_activation:              'sep-merge_gates2_swiglu'
+  use_attn_renorm:              True
+  use_add_merge:                False
+  use_rad_l_parametrization:    True
+  softcap:                      null
+  ffn_activation:               'sep-merge_gates2_swiglu'
+  use_grid_mlp:                 True
+
+  use_gate_force_head:          True
+
+  alpha_drop:                   0.0
+  attn_mask_rate:               0.0
+  attn_weights_drop:            0.1     # 与 100% 档一致。20%+40ep 的过拟合压力远小于 5%+150ep，
+  value_drop:                   0.0     # 故沿用全集配置的正则强度，同时保证与 100% 档可比。
+  drop_path_rate:               0.05    # 两臂相同；若要调，两份必须一起调。
+  proj_drop:                    0.0
+  ffn_drop:                     0.0
+
+  enable_compile:               True    # 论证见 N2L2C64_scd_direct-finetune_bf16-tf32-encompile.yml 文件头
+  compile_dynamic:              True
+  use_amp:                      True    # 块级 bf16；与 optim.amp/fp16 互斥
+
+  gradient_checkpointing_block_list:    [0, 0]
+
+  enforce_max_neighbors_strictly:       True
+
+  avg_num_nodes:                1       # Remove the division after sum aggregation over nodes for energy prediction
+
+
+optim:
+  batch_size:                   64      # per-GPU；8 GPU -> global 512
+  grad_accumulation_steps:      1
+  eval_batch_size:              64
+  load_balancing:               atoms
+  num_workers:                  0       # lmdb env not fork-safe -> num_workers>0 segfaults
+  lr_initial:                   0.0002  # AdamW lr for the NON-matrix params (biases, norms, embeddings)
+
+  matmul_precision:             high    # TF32
+
+  optimizer:                    HybridMuon
+  optimizer_params:
+    weight_decay:               0.001
+    update_scale:               moonlight
+    muon_lr:                    0.0004
+    momentum:                   0.95
+    nesterov:                   True
+    ns_steps:                   5
+    betas:                      [0.9, 0.95]
+    eps:                        1.0e-8
+    # --- Muon-side divergence guard [skip-step protection] ---------------------------
+    skip_nonfinite:             True
+    spike_factor:               8.0
+    spike_ema_decay:            0.99
+    spike_warmup_steps:         200
+    spike_max_consecutive_skips: 25
+    spike_abs_threshold:        null
+    spike_abs_max_consecutive:  10
+    log_every:                  200
+  scheduler:                    LambdaLR
+  scheduler_params:
+    lambda_type:                cosine
+    warmup_factor:              0.001
+    warmup_epochs:              1.5     # 20% 子集下 1 ep ≈ 555 步；1.5 ep ≈ 832 步的 warmup
+                                        # （全集配置的 0.5 ep 在这里只有 277 步，对 HybridMuon 偏短）
+    lr_min_factor:              0.01
+
+  max_epochs:                   40      # ≈ 22k optimizer steps（见文件头「步数预算」）
+  clip_grad_norm:               100
+  ema_decay:                    0.999
+
+  eval_every:                   2000    # ≈ 每 3.6 epoch 一次，全程 11 次，供早停/best_checkpoint
+
+  use_denoising_pos:            False   # 监督微调，不做去噪辅助任务
+  denoising_pos_params:                 # 惰性，但 trainer 会无条件解析，必须存在
+    prob:                       0.0
+    fixed_noise_std:            True
+    std:                        0.04
+    corrupt_ratio:              null
+    all_atoms:                  True
+    num_steps:                  50
+    std_low:                    0.01
+    std_high:                   0.5
+    min_num_atoms:              null
+    strict_max_ratio:           null
+  denoising_pos_coefficient:    1.0
+
+  use_compile:                  False   # 与 model.enable_compile 互斥
+
+  ######################################################################################
+  #  ★ 这是 A/B 两臂**唯一**的差异行。
+  #  A 臂（本文件）：加载 stage-1 纯 SCD 预训练权重。
+  #  B 臂：整行删除 -> 随机初始化。
+  #  注意 energy_block / force_block 在 stage-1 里都是零梯度的（≈随机初始化），
+  #  stress_block 在 ckpt 里根本不存在 -> 两臂的三个输出头起点其实都接近随机，
+  #  差异集中在 backbone + AdaNorm。这正是本实验想测的东西。
+  ######################################################################################
+  

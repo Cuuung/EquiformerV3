@@ -1,0 +1,301 @@
+########################################################################################
+#  20% 标签子集 · 保守力（gradient）微调
+#
+#  与 direct/scd_test/N2L2C64_sub20pct_direct_{A,B}*.yml 用**同一个** 20% 子集
+#  （sample_n=284079 + sample_seed=0，且两边都不设 max_atoms，见下）。
+#
+#  A/B 两臂共用本文件，只在启动命令上分叉：
+#    A（预训练）: --optim.load_pretrained_weights=<stage-1 或 direct-20% 的 checkpoint.pt>
+#    B（对照）  : 不加该参数，随机初始化
+#  架构两臂完全相同（含整套 SCD/AdaNorm 模块），保证是干净 A/B。
+#
+#  ===== ★ max_atoms 必须不设 ★ =======================================================
+#  base_trainer.py 的顺序是：先按 max_atoms 过滤 -> 再对**过滤后**的数据集做
+#  randperm 抽样（:382-394 然后 :401-424），而抽样用的是
+#  `arange(len(train_dataset))` 的位置。
+#  => 一旦设了 max_atoms，len(train_dataset) 从 1,420,395 变成别的数，整个排列重排，
+#     抽到的 284,079 帧和 direct 20% 臂**不是同一批样本**，标签效率曲线直接失去可比性。
+#  所以本文件刻意不设 max_atoms，与 direct 20% 两臂一致（对照臂 gradft 的
+#  max_atoms: 150 在这里必须放弃 —— 子集一致性优先级更高）。
+#  连带效果：val 也没有 max_atoms（val 默认继承 train 设置，base_trainer.py:446-449），
+#  两臂都在完整的 158,367 帧 val 上评测，与 direct 20% 臂口径一致。
+#
+#  ⚠ 代价：训练集重新包含 >150 原子的大晶胞尾部（MPtrj 最大 444 原子），而保守力是
+#    double backward，峰值显存比 direct 高。真的 OOM 时**不要加 max_atoms**，改成
+#    降 batch_size + 等比例提高 grad_accumulation_steps（保持 global 512，
+#    steps/epoch 不变，A/B 仍可比）。
+#
+#  ===== 步数预算 =====================================================================
+#  global batch 512（16 per-GPU x 8 GPU x accum 4）；20% 子集 284,079 帧
+#    -> 284079/128 = 2220 batch/rank/epoch -> //4 = 555 optimizer step/epoch
+#  全集 gradft 的预算是 5 epoch x 2774 step = 13,870 step。
+#  本文件取 max_epochs: 25 -> 13,875 step，与全集 gradft **步数对齐**。
+#  warmup 同样按步数对齐：全集 0.1ep x 2774 = 277 步 -> 本文件 0.5ep x 555 = 277 步。
+#
+#  ===== 精度/编译档位：TF32 + eager ===================================================
+#  与 N2L2C64_scd_grad-finetune_tf32-eager.yml 完全相同，enable_compile 在本路径上
+#  必崩（use_force_cond=False 时 fe 退化成 0 维标量，_prime/mark_dynamic 维数不符），
+#  完整论证见该文件头。
+#
+#  ★★ 换 stage-1 臂时必须同步的键：scd_adanorm_use_node_feat / scd_adanorm_scope /
+#  scd_inject / num_channels 必须与 ckpt 逐字一致，否则 AdaNorm fc 形状 assert 崩。
+#  对照表见 N2L2C64_scd_grad-finetune_tf32-eager.yml 文件头。
+########################################################################################
+
+dataset:
+  train:
+    format: ase_db
+    src:
+      - /mnt/afs/share/dataset/periodicSystem/MPtrj/aselmdb/train
+    a2g_args:
+      r_energy: True      # already use `uncorrected_total_energy` after pre-processing
+      r_forces: True
+      r_stress: True
+    transforms:
+      normalizer:
+        energy:
+          mean:     0.0
+          rmsd:     0.8124567446457275    # (1) Following eSEN
+                                          # (2) Remove the division after sum aggregation for energy prediction
+        forces:
+          mean:     0.0
+          rmsd:     0.8124567446457275
+        stress:
+          mean:     0.0
+          rmsd:     0.8124567446457275
+
+      element_references:
+        energy:
+          file: experimental/configs/omat24/mptrj/preprocessing/equiformer_v2_mptrj_energy_element_references.npz
+
+    # 不设 max_atoms —— 见文件头，设了会换掉整个子集
+    sample_n:       284079  # 20% of 1,420,395。与 direct 20% 臂必须一致
+    sample_seed:    0       # 与 direct 20% 臂必须一致 —— 这两行决定了「同一个子集」
+
+  val:
+    format: ase_db
+    src:
+      - /mnt/afs/share/dataset/periodicSystem/MPtrj/aselmdb/val
+    a2g_args:
+      r_energy: True      # already use `uncorrected_total_energy` after pre-processing
+      r_forces: True
+      r_stress: True
+
+
+trainer:              equiformer_v3_dens_trainer
+
+
+logger:
+  name:               wandb
+  project:            equiformer_v3_mptrj
+
+
+hide_eval_progressbar: False
+
+
+evaluation_metrics:
+  primary_metric: forces_mae
+  metrics:
+    energy:
+      - mae
+      - per_atom_mae
+    forces:
+      - mae
+      - cosine_similarity
+    stress:
+      - mae
+
+
+outputs:
+  energy:
+    level:                system
+    property:             energy
+  forces:
+    level:                atom
+    property:             forces
+    train_on_free_atoms:  True
+    eval_on_free_atoms:   True
+  stress:
+    level:                system
+    property:             stress
+
+
+loss_functions:
+  - energy:
+      fn:                 per_atom_mae
+      coefficient:        5      # E:F:S = 5:10:100，与对照臂一致
+  - forces:
+      fn:                 l2mae
+      coefficient:        10
+  - stress:
+      fn:                 mae
+      coefficient:        100
+
+
+model:
+  ######################################################################################
+  #  架构必须与要加载的 ckpt 逐项一致，否则 load_pretrained_weights 的 shape 匹配会大面积落空。
+  #  **model.name 必须是 equiformer_v3_scd**：SCD 的 AdaNorm 把原 norm 包了一层，ckpt 里的键是
+  #  blocks.*.norm_1.norm.affine_weight + blocks.*.norm_1.fc.*。用裸 equiformer_v3 加载，
+  #  norm 的 affine 与整套 AdaNorm fc 会被静默跳过 —— 预训练学到的调制全丢。
+  #  B 臂（随机初始化）也用同一份架构，保证 A/B 只差「有没有加载权重」这一件事。
+  ######################################################################################
+  name:                         equiformer_v3_scd
+
+  use_scd:                      True    # 必须 True：False 时 _rebuild_blocks_with_adanorm 不执行，
+                                        # AdaNorm 模块根本不存在，ckpt 对不上
+  use_force_cond:               False   # 与 stage-1 一致。ckpt 里没有 force_embedding.* 键，
+                                        # 设 True 会凭空造一个随机初始化的空转模块
+  scd_inject:                   adanorm
+  scd_adanorm_targets:          ['attn', 'ffn']
+  scd_adanorm_scope:            per_degree
+  scd_adanorm_use_node_feat:    False   # ★ 必须与 ckpt 一致，否则 fc[0] 形状对不上直接崩
+                                        # （C=64 时 False -> [64, 64]，True -> [64, 128]）。
+                                        # 附带好处：False 时调制不依赖节点特征 x，「能量经调制系数
+                                        # 依赖坐标」这条路径不存在 => F = -dE/dpos 自动严格成立。
+  scd_adanorm_detach_node_feat: False   # use_node_feat=False 时惰性；切到 True 的臂时**必须**保持
+                                        # False —— detach 会截断能量对坐标的依赖路径，autograd 的
+                                        # -dE/dpos 不再是真实梯度（docs/SCD_NOTES.md §7.4）。
+  scd_p_dropcond:               0.2     # 微调期 do_self_cond 恒 False，本项与 cond_clip 均不生效，
+  scd_cond_clip:                100.0   # 保留只为与 stage-1 对齐、便于 diff
+  scd_detach_cond:              False
+  scd_reg_noise_std:            0.0
+  scd_freeze_element_embedding: none    # 冻结是为了防预训练期嵌入塌缩，监督微调阶段应放开。
+                                        # 只改 requires_grad、不改形状 => 不影响 ckpt 加载。
+  scd_freeze_mask_token:        False   # 微调期 cond 恒等于 mask_token，它会持续收到真实梯度
+
+  use_pbc:                      True
+  use_pbc_single:               True      # Process batch PBC graphs one at a time.
+                                          # This argument is set to True when training on MPtrj.
+  otf_graph:                    True
+
+  regress_forces:               True
+  regress_stress:               True    # 保守力路径的 stress 来自对 displacement 求导，
+                                        # 不需要 stress_block（它只在 direct_prediction 下构造）
+  direct_prediction:            False   # forces = -dE/dx，stress from virial
+
+  max_neighbors:                300
+  max_radius:                   6.0
+  num_radial_basis:             10
+  max_num_elements:             128
+
+  num_layers:                   2
+  num_channels:                 64
+  attn_hidden_channels:         32
+  num_heads:                    8
+  attn_alpha_channels:          64
+  attn_value_channels:          16
+  ffn_hidden_channels:          512
+  norm_type:                    'merge_layer_norm'
+
+  lmax:                         2
+  mmax:                         2
+  attn_grid_resolution_list:    [14,  8]
+  ffn_grid_resolution_list:     [14, 14]
+
+  edge_channels:                128
+  use_atom_edge_embedding:      True
+  use_envelope:                 True
+
+  attn_activation:              'sep-merge_gates2_swiglu'
+  use_attn_renorm:              True
+  use_add_merge:                False
+  use_rad_l_parametrization:    True
+  softcap:                      null
+  ffn_activation:               'sep-merge_gates2_swiglu'
+  use_grid_mlp:                 True
+
+  use_gate_force_head:          True    # direct_prediction=False 下 force_block 不构造，本项对
+                                        # dens_block 仍生效；与 ckpt 一致以保证 dens_block 可加载
+
+  alpha_drop:                   0.0
+  attn_mask_rate:               0.0
+  attn_weights_drop:            0.0     # 微调关掉（stage-1 是 0.1）；dropout 无权重，不影响加载
+  value_drop:                   0.0
+  drop_path_rate:               0.0     # 微调关掉（stage-1 是 0.1）
+  proj_drop:                    0.0
+  ffn_drop:                     0.0
+
+  enable_compile:               False   # 见文件头「精度/编译档位」
+  compile_dynamic:              False   # enable_compile 关时无意义，显式写出以免误开
+  use_amp:                      False   # 保守力走纯 fp32；bf16/fp16 与双反向的组合未在本路径验证
+
+  gradient_checkpointing_block_list:    [0, 0]      # length == num_layers；显存紧张改 [1, 1]
+
+  enforce_max_neighbors_strictly:       True
+
+  avg_num_nodes:                1       # Remove the division after sum aggregation over nodes for energy prediction
+
+
+optim:
+  ######################################################################################
+  #  保守力 = double backward，fp32（不要传 --amp：amp 会在 so3.py 的 Wigner 构造上
+  #  报 Float/Half index_put 失配）。单卡显存只取决于 per-GPU batch_size，与卡数无关。
+  #  ⚠ 本档没有 max_atoms，训练集含最大 444 原子的晶胞，峰值显存高于全集 gradft。
+  #    OOM 时降 batch_size 并等比例提高 grad_accumulation_steps（保持 global 512）。
+  ######################################################################################
+  batch_size:                   16      # per-GPU；8 GPU x 16 x accum4 = global 512
+  grad_accumulation_steps:      4
+  eval_batch_size:              16
+  load_balancing:               atoms
+  num_workers:                  0       # lmdb env not fork-safe -> num_workers>0 segfaults
+  lr_initial:                   0.00005 # AdamW lr for the NON-matrix params (biases, norms, embeddings)
+
+  matmul_precision:             high    # TF32：加速 fp32 matmul（默认 highest = 纯 fp32）。
+                                        # 想做纯 fp32 数值基线时改回 highest。
+
+  optimizer:                    HybridMuon
+  optimizer_params:
+    weight_decay:               0.001
+    update_scale:               moonlight
+    muon_lr:                    0.00015   # 与全集 gradft 同值，保证跨档位可比
+    momentum:                   0.95
+    nesterov:                   True
+    ns_steps:                   5
+    betas:                      [0.9, 0.95]
+    eps:                        1.0e-8
+    # --- Muon-side divergence guard [skip-step protection] ---------------------------
+    skip_nonfinite:             True
+    spike_factor:               8.0
+    spike_ema_decay:            0.99
+    spike_warmup_steps:         200
+    spike_max_consecutive_skips: 25
+    spike_abs_threshold:        null   # N2L2C64 上 abs=4.0 是 30M 的调法，会误杀
+    spike_abs_max_consecutive:  10
+    log_every:                  200
+  scheduler:                    LambdaLR
+  scheduler_params:
+    lambda_type:                cosine
+    warmup_factor:              0.001
+    warmup_epochs:              0.5     # 555 step/ep x 0.5 = 277 步，与全集 gradft
+                                        # （2774 x 0.1 = 277 步）步数对齐
+    lr_min_factor:              0.01
+
+  max_epochs:                   25      # 25 x 555 = 13,875 步 ≈ 全集 gradft 的 5 x 2774 = 13,870 步
+  clip_grad_norm:               100
+  ema_decay:                    0.999
+
+  eval_every:                   2000    # 全集档用 5000；本档总步数只有 ~13.9k，2000 给出 ~7 个评测点，
+                                        # best_checkpoint（完整 val 上的 forces_mae）分辨率才够
+
+  use_denoising_pos:            False   # 微调不做去噪辅助任务。
+                                        # 副作用（DDP 安全，已核对）：dens_block 仍被构造并前向，
+                                        # 但输出被全零 noise_mask 吃掉 -> 零梯度而非无梯度；
+                                        # scd_cond_head 同理靠 `0.0 * ...` 留在图里
+                                        # （equiformer_v3_scd.py:271-275）。两者都不会触发
+                                        # find_unused_parameters=False 的 reduction 报错。
+  denoising_pos_params:                 # use_denoising_pos=False 时全部惰性，但 trainer 会
+    prob:                       0.0     # 无条件 DenoisingPosParams(**...) 解析，故必须存在
+    fixed_noise_std:            True    # trainer 断言必须为 True
+    std:                        0.04
+    corrupt_ratio:              null
+    all_atoms:                  True
+    num_steps:                  50
+    std_low:                    0.01
+    std_high:                   0.5
+    min_num_atoms:              null
+    strict_max_ratio:           null
+  denoising_pos_coefficient:    1.0
+
+  use_compile:                  False   # 外层 torch.compile：对保守力双反向不稳，且与
+                                        # model.enable_compile 互斥（trainer._setup_compile 会报错）
