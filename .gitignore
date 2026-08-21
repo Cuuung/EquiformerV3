@@ -70,3 +70,8 @@ metadata*.npz
 # profiler traces (EQV3_PROF / ESEN_PROF output) — multi-GB, dev artifacts only
 docs/train_speed_analysis/**/*.trace.json
 docs/train_speed_analysis/**/*.png
+
+# 百度百舸（AIHC）适配层：只在百舸开发机上用，路径（PFS /mnt/pfs）和平台变量语义
+# 都是那一家的，不进仓库。腾讯云 TiOne 的对应文件 Dockerfile.tione 是跟踪的。
+/Dockerfile.baidu
+/experimental/scripts/train/omat24/equiformer_v3/compile_test/direct_encompile-bf16_tf32_baidu.sh
